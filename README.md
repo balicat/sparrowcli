@@ -18,9 +18,8 @@ Arrow IPC when you're piping — the same command does both.**
 sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:demo
 
 sparrow ls
+sparrow info series_data
 sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
-sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
-  | duckdb -c "SELECT MAX(value) FROM read_arrow('/dev/stdin')"
 ```
 
 ## Commands
@@ -82,6 +81,17 @@ DuckDB, Spark and pyarrow read the file back with the key — and refuse it
 without. Verified against an Envoy that requires client certificates: no
 cert → refused (exit 2); cert → query runs.
 
+## Install
+
+Download a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
+(Linux, macOS and Windows; amd64 + arm64), unpack it and put `sparrow` on your
+PATH. Checksums included. Or build from source:
+
+```sh
+go build -o sparrow .        # Go ≥ 1.25; pure Go, no cgo — trivially cross-compiles
+GOOS=windows go build -o sparrow.exe .
+```
+
 ## For AI agents (Claude Code, etc.)
 
 AI agents don't need a Flight client library — they can just call the CLI.
@@ -111,19 +121,6 @@ Conventions agents can rely on:
 - Prefer `LIMIT` in SQL — `--max-rows` still downloads the full result.
 - Profiles live in `~/.sparrow/config.json`; `sparrow profiles use <name>`
   switches the default, `-s grpc+tls://host:port --basic u:p` works ad-hoc.
-
-## Install
-
-Grab a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
-— Linux, macOS and Windows, amd64 + arm64 — unpack, and put `sparrow` on your
-PATH. Checksums included.
-
-Or build from source:
-
-```sh
-go build -o sparrow .        # Go ≥ 1.25; pure Go, no cgo — trivially cross-compiles
-GOOS=windows go build -o sparrow.exe .
-```
 
 ## The Sparrow family
 
