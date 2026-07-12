@@ -122,6 +122,23 @@ Conventions agents can rely on:
 - Profiles live in `~/.sparrow/config.json`; `sparrow profiles use <name>`
   switches the default, `-s grpc+tls://host:port --basic u:p` works ad-hoc.
 
+## The landscape (as of July 2026)
+
+Other CLIs can reach a Flight SQL server — none keep the data columnar on the
+way through:
+
+| | scope | Arrow stays Arrow? |
+|---|---|---|
+| `flight_sql_client` ([apache/arrow-rs](https://github.com/apache/arrow-rs/blob/main/arrow-flight/README.md)) | any Flight SQL server | ✗ — "basic" example binary, one-shot RPC commands, text out |
+| [`timvw/arrow-flight-sql-client`](https://github.com/timvw/arrow-flight-sql-client) | any Flight SQL server | ✗ — small RPC-mirror CLI, text out |
+| [`usql`](https://github.com/xo/usql) | 40+ databases; Flight SQL as one driver | ✗ — excellent universal shell, but results flatten through `database/sql` to rows and text |
+| `bendsql` (né "Arrow CLI") | Databend only | — what happens when an Arrow CLI grows up inside one vendor |
+| **`sparrow`** | **any Flight SQL server** | **✓ — raw Arrow IPC in a pipe, parquet sinks, typed formats** |
+
+The gap sparrow fills isn't "a CLI exists" — it's Arrow-native ergonomics:
+catalog discovery over the Flight RPCs, profiles, `orient`, output that follows
+the consumer, and conventions agents can script against.
+
 ## The Sparrow family
 
 One transport, many clients: [Sparrow](https://sparrowflight.io) (the Flight
