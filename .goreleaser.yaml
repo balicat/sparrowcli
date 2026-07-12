@@ -1,0 +1,47 @@
+version: 2
+project_name: sparrow
+
+builds:
+  - id: sparrow
+    binary: sparrow
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: default
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs"
+      - "^chore"
+
+release:
+  footer: |
+    **The terminal client for any Apache Arrow Flight / Flight SQL server.**
+
+    Quick start against a live 136-million-row endpoint — see the
+    [README](https://github.com/balicat/sparrowcli#quick-start--four-commands).

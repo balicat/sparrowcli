@@ -37,7 +37,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const version = "0.4.0"
+// version is stamped by goreleaser (-X main.version={{.Version}}) on releases
+var version = "0.4.0-dev"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
