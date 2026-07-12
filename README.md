@@ -8,8 +8,8 @@ Most Flight servers ship SDKs. Sometimes you just want to inspect one from a
 terminal. And the pipe is first-class: **a table when you're reading, raw
 Arrow IPC when you're piping — the same command does both.**
 
-> **Status** &nbsp; ✔ works against four independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
-> **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS*
+> **Status** &nbsp; ✔ works against five independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
+> **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS &nbsp; ✔ InfluxDB 3 Core
 
 ```sh
 # a live 136-million-row Flight SQL server, open for exactly this:
@@ -31,9 +31,18 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
-Auth: `--basic user:pass` (API key as user works; Bearer handoff adopted
-automatically, GizmoSQL-style). TLS: `grpc://` plain, `grpc+tls://` verified,
-`--tls-skip-verify` for self-signed.
+Auth — the two adapters that cover the whole tested landscape:
+
+```sh
+--basic user:pass                          # GizmoSQL, Dremio, Sparrow (API key as user
+                                           # works; Bearer handoff adopted automatically)
+--bearer TOKEN --header database=mydb      # InfluxDB 3 style: token + per-call metadata
+```
+
+TLS: `grpc://` plain, `grpc+tls://` verified, `--tls-skip-verify` for
+self-signed. The vendor fingerprint tries `GetSqlInfo`, then `SELECT version()`
+(Dremio answers the second, InfluxDB the first — between them, every server
+identifies itself).
 
 ## Output — pick your consumer
 
@@ -101,9 +110,9 @@ terminal).
 
 ---
 
-\* Dremio: connect/ls/sql validated 2026-07-09 via the same auth + discovery
-path (see [sparrowflight.io/cli](https://sparrowflight.io/cli)); its SQL
-dialect quirks are its own business — your SQL passes through untouched.
+Dialect note: your SQL passes through untouched — quirks are the server's
+business (e.g. Dremio rejects aliases on FROM-less SELECTs; the CLI reports
+the server's error verbatim and exits 1).
 
 ## License
 

@@ -31,19 +31,22 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
 type Profile struct {
-	URI           string `json:"uri"`
-	Auth          string `json:"auth"` // "basic" | "none"
-	User          string `json:"user,omitempty"`
-	Pass          string `json:"pass,omitempty"`
-	TLSSkipVerify bool   `json:"tls_skip_verify,omitempty"`
+	URI           string            `json:"uri"`
+	Auth          string            `json:"auth"` // "basic" | "bearer" | "none"
+	User          string            `json:"user,omitempty"`
+	Pass          string            `json:"pass,omitempty"`
+	Token         string            `json:"token,omitempty"`   // bearer auth (InfluxDB 3 style)
+	Headers       map[string]string `json:"headers,omitempty"` // extra per-call metadata (e.g. database: mydb)
+	TLSSkipVerify bool              `json:"tls_skip_verify,omitempty"`
 }
 
 type Config struct {
@@ -115,19 +118,52 @@ func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, e
 	if err != nil {
 		return nil, ctx, connError{err}
 	}
-	if p.Auth == "basic" {
+	// extra per-call headers ride the outgoing metadata (InfluxDB 3 needs
+	// `database: <db>` on every call)
+	if len(p.Headers) > 0 {
+		kv := make([]string, 0, len(p.Headers)*2)
+		for k, v := range p.Headers {
+			kv = append(kv, k, v)
+		}
+		ctx = metadata.AppendToOutgoingContext(ctx, kv...)
+	}
+	switch p.Auth {
+	case "basic":
 		authCtx, err := cl.Client.AuthenticateBasicToken(ctx, p.User, p.Pass)
 		if err != nil {
 			cl.Close()
 			return nil, ctx, connError{fmt.Errorf("auth failed: %w", err)}
 		}
 		return cl, authCtx, nil
+	case "bearer":
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+p.Token)
 	}
 	return cl, ctx, nil
 }
 
+// multiFlag collects a repeatable --header k=v flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+func parseHeaders(hs []string) (map[string]string, error) {
+	if len(hs) == 0 {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, h := range hs {
+		k, v, ok := strings.Cut(h, "=")
+		if !ok {
+			return nil, fmt.Errorf("--header wants key=value (got %q)", h)
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out, nil
+}
+
 // resolveProfile picks the connection: -s <profile|uri>, else the default profile.
-func resolveProfile(server, basic string, tlsSkip bool) (Profile, string, error) {
+func resolveProfile(server, basic, bearer string, headers []string, tlsSkip bool) (Profile, string, error) {
 	cfg := loadConfig()
 	name := server
 	if name == "" {
@@ -142,6 +178,14 @@ func resolveProfile(server, basic string, tlsSkip bool) (Profile, string, error)
 			u, pw, _ := strings.Cut(basic, ":")
 			p.Auth, p.User, p.Pass = "basic", u, pw
 		}
+		if bearer != "" {
+			p.Auth, p.Token = "bearer", bearer
+		}
+		h, err := parseHeaders(headers)
+		if err != nil {
+			return Profile{}, "", err
+		}
+		p.Headers = h
 		return p, "(ad-hoc)", nil
 	}
 	if server == "" && cfg.Default == "" {
@@ -471,17 +515,28 @@ func cmdConnect(args []string) error {
 verify a Flight SQL server and save it as a profile (the first becomes default)
 example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:demo`)
 	basic := fs.String("basic", "", "user:pass (API key as user is fine)")
+	bearer := fs.String("bearer", "", "bearer token (InfluxDB 3 style)")
+	var hdrs multiFlag
+	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable; e.g. --header database=mydb)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	name := fs.String("name", "default", "profile name")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass] [--tls-skip-verify] [--name profile]")
+		return fmt.Errorf("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass | --bearer TOKEN] [--header k=v] [--tls-skip-verify] [--name profile]")
 	}
 	p := Profile{URI: pos[0], Auth: "none", TLSSkipVerify: *tlsSkip}
 	if *basic != "" {
 		u, pw, _ := strings.Cut(*basic, ":")
 		p.Auth, p.User, p.Pass = "basic", u, pw
 	}
+	if *bearer != "" {
+		p.Auth, p.Token = "bearer", *bearer
+	}
+	h, err := parseHeaders(hdrs)
+	if err != nil {
+		return err
+	}
+	p.Headers = h
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -492,53 +547,23 @@ example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:dem
 	}
 	defer cl.Close()
 
-	// probe: GetSqlInfo names the vendor on most servers; SELECT 1 is the fallback
-	// (Dremio errors on GetSqlInfo; never alias a FROM-less SELECT — see dialect-compat.md)
-	serverDesc := ""
-	var probeErrs []string
-	if info, err := cl.GetSqlInfo(ctx, []flightsql.SqlInfo{
-		flightsql.SqlInfoFlightSqlServerName, flightsql.SqlInfoFlightSqlServerVersion,
-	}); err != nil {
-		probeErrs = append(probeErrs, "GetSqlInfo: "+err.Error())
-	} else if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err != nil {
-		probeErrs = append(probeErrs, "GetSqlInfo DoGet: "+err.Error())
-	} else {
-		vals := []string{}
-		for rdr.Next() {
-			rec := rdr.Record()
-			if rec.NumCols() >= 2 {
-				union := rec.Column(1)
-				for r := 0; r < int(rec.NumRows()); r++ {
-					// only SERVER_NAME (0) and SERVER_VERSION (1) — some
-					// servers return their whole info table regardless of
-					// the requested subset
-					switch cell(rec.Column(0), r) {
-					case "0", "1":
-						vals = append(vals, cell(union, r))
-					}
-				}
-			}
+	// fingerprint: GetSqlInfo → SELECT version() (probeVendor); last resort
+	// SELECT 1 just proves the query path (never alias a FROM-less SELECT —
+	// Dremio; see dialect-compat.md)
+	serverDesc := probeVendor(ctx, cl)
+	if serverDesc == "" {
+		info, err := cl.Execute(ctx, "SELECT 1")
+		if err != nil {
+			return fmt.Errorf("connected but probes failed: %w", err)
 		}
-		if err := rdr.Err(); err != nil {
-			probeErrs = append(probeErrs, "GetSqlInfo read: "+err.Error())
+		rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+		if err != nil {
+			return fmt.Errorf("connected but probes failed: %w", err)
+		}
+		for rdr.Next() {
 		}
 		rdr.Release()
-		serverDesc = strings.TrimSpace(strings.Join(vals, " "))
-	}
-	if serverDesc == "" {
-		if info, err := cl.Execute(ctx, "SELECT 1"); err != nil {
-			probeErrs = append(probeErrs, "SELECT 1: "+err.Error())
-		} else if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err != nil {
-			probeErrs = append(probeErrs, "SELECT 1 DoGet: "+err.Error())
-		} else {
-			for rdr.Next() {
-			}
-			rdr.Release()
-			serverDesc = "Flight SQL server (vendor info unsupported)"
-		}
-	}
-	if serverDesc == "" {
-		return fmt.Errorf("connected but probes failed:\n  %s", strings.Join(probeErrs, "\n  "))
+		serverDesc = "Flight SQL server (vendor info unsupported)"
 	}
 
 	cfg := loadConfig()
@@ -560,11 +585,14 @@ list tables via the GetTables RPC (works identically on every Flight SQL server)
 example: sparrow ls -o md`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
+	var hdrs multiFlag
+	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	pos := parseFlags(fs, args)
 
-	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
+	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
 	if err != nil {
 		return err
 	}
@@ -602,6 +630,9 @@ examples: sparrow sql "SELECT 42 AS x" -o md
           sparrow sql "SELECT * FROM t" | duckdb   (pipe = raw Arrow IPC)`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
+	var hdrs multiFlag
+	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 table, 1000 md, unlimited otherwise)")
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
@@ -628,7 +659,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		return fmt.Errorf(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
-	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
+	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
 	if err != nil {
 		return err
 	}
@@ -661,33 +692,47 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	return nil
 }
 
-// probeVendor asks GetSqlInfo for SERVER_NAME + SERVER_VERSION; empty string
-// if the server doesn't support it (Dremio errors on GetSqlInfo).
+// probeVendor fingerprints the server: GetSqlInfo SERVER_NAME+VERSION first
+// (EnergyScope, GizmoSQL, InfluxDB), then SELECT version() (Dremio errors on
+// GetSqlInfo but answers version() — the exact reverse of InfluxDB).
 func probeVendor(ctx context.Context, cl *flightsql.Client) string {
-	info, err := cl.GetSqlInfo(ctx, []flightsql.SqlInfo{
+	if info, err := cl.GetSqlInfo(ctx, []flightsql.SqlInfo{
 		flightsql.SqlInfoFlightSqlServerName, flightsql.SqlInfoFlightSqlServerVersion,
-	})
-	if err != nil {
-		return ""
-	}
-	rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
-	if err != nil {
-		return ""
-	}
-	defer rdr.Release()
-	vals := []string{}
-	for rdr.Next() {
-		rec := rdr.Record()
-		if rec.NumCols() >= 2 {
-			for r := 0; r < int(rec.NumRows()); r++ {
-				switch cell(rec.Column(0), r) {
-				case "0", "1":
-					vals = append(vals, cell(rec.Column(1), r))
+	}); err == nil {
+		if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err == nil {
+			vals := []string{}
+			for rdr.Next() {
+				rec := rdr.Record()
+				if rec.NumCols() >= 2 {
+					for r := 0; r < int(rec.NumRows()); r++ {
+						switch cell(rec.Column(0), r) {
+						case "0", "1":
+							vals = append(vals, cell(rec.Column(1), r))
+						}
+					}
 				}
+			}
+			rdr.Release()
+			if v := strings.TrimSpace(strings.Join(vals, " ")); v != "" {
+				return v
 			}
 		}
 	}
-	return strings.TrimSpace(strings.Join(vals, " "))
+	// no alias — FROM-less SELECTs can't take one on Dremio
+	if info, err := cl.Execute(ctx, "SELECT version()"); err == nil {
+		if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err == nil {
+			v := ""
+			for rdr.Next() {
+				rec := rdr.Record()
+				if v == "" && rec.NumRows() > 0 && rec.NumCols() > 0 {
+					v = cell(rec.Column(0), 0)
+				}
+			}
+			rdr.Release()
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // cmdOrient prints a one-shot markdown orientation: vendor, every table,
@@ -699,10 +744,13 @@ one-shot markdown orientation: server vendor, every table, every schema
 example: sparrow orient -s gizmo`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
+	var hdrs multiFlag
+	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	parseFlags(fs, args)
 
-	p, pname, err := resolveProfile(*server, *basic, *tlsSkip)
+	p, pname, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
 	if err != nil {
 		return err
 	}
@@ -789,8 +837,8 @@ example: sparrow orient -s gizmo`)
 		fmt.Printf("| %s | %s | %s | %s |\n", t.catalog, t.schema, t.name, t.typ)
 	}
 	for _, t := range tables {
-		if t.arrow == nil {
-			continue
+		if t.arrow == nil || t.arrow.NumFields() == 0 {
+			continue // Dremio returns empty schemas in GetTables — skip the noise
 		}
 		fmt.Printf("\n## %s\n\n", t.name)
 		fmt.Println("| column | type | nullable |")
@@ -831,6 +879,9 @@ show a table's schema, catalog and row count before pulling anything
 example: sparrow info series_data`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
+	var hdrs multiFlag
+	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	noCount := fs.Bool("no-count", false, "skip the COUNT(*) row estimate")
 	pos := parseFlags(fs, args)
@@ -839,7 +890,7 @@ example: sparrow info series_data`)
 	}
 	table := pos[0]
 
-	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
+	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
 	if err != nil {
 		return err
 	}
