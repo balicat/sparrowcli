@@ -480,7 +480,13 @@ func cmdConnect(args []string) error {
 			if rec.NumCols() >= 2 {
 				union := rec.Column(1)
 				for r := 0; r < int(rec.NumRows()); r++ {
-					vals = append(vals, cell(union, r))
+					// only SERVER_NAME (0) and SERVER_VERSION (1) — some
+					// servers return their whole info table regardless of
+					// the requested subset
+					switch cell(rec.Column(0), r) {
+					case "0", "1":
+						vals = append(vals, cell(union, r))
+					}
 				}
 			}
 		}
