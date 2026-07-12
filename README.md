@@ -4,6 +4,10 @@
 One static binary: browse the catalog, run SQL, stream Arrow onward.
 Human-friendly on a TTY, machine-friendly in a pipe, **agent-friendly by design**.
 
+Most Flight servers ship SDKs. Sometimes you just want to inspect one from a
+terminal. And the pipe is first-class: **a table when you're reading, raw
+Arrow IPC when you're piping — the same command does both.**
+
 > **Status** &nbsp; ✔ works against four independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
 > **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS*
 
@@ -51,8 +55,8 @@ sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
 
 ## For AI agents (Claude Code, etc.)
 
-This CLI is how an agent looks at a Flight server without writing a client.
-Three commands orient it completely; `-o md` returns tables it can read
+AI agents don't need a Flight client library — they can just call the CLI.
+Three commands orient one completely; `-o md` returns tables it can read
 natively:
 
 ```sh
