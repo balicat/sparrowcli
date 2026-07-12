@@ -3,11 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,15 +18,20 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-const version = "0.0.1-m0"
+const version = "0.1.0-m1"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -143,70 +151,274 @@ func cell(col arrow.Array, row int) string {
 	if col.IsNull(row) {
 		return "NULL"
 	}
+	// dense-union values (e.g. GetSqlInfo) render as [typeid,"value"] via
+	// ValueStr — unwrap to the active child instead
+	switch u := col.(type) {
+	case *array.DenseUnion:
+		return cell(u.Field(u.ChildID(row)), int(u.ValueOffset(row)))
+	case *array.SparseUnion:
+		return cell(u.Field(u.ChildID(row)), row)
+	}
 	return col.ValueStr(row)
 }
 
-// streamRecords consumes a Flight reader: pretty table on a TTY, Arrow IPC in a pipe.
-func streamRecords(rdr *flight.Reader, maxRows int) (int64, error) {
-	total := int64(0)
-	if stdoutIsTTY() {
-		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		schema := rdr.Schema()
-		heads := make([]string, len(schema.Fields()))
-		for i, f := range schema.Fields() {
-			heads[i] = f.Name
-		}
-		fmt.Fprintln(w, strings.Join(heads, "\t"))
-		printed := 0
-		for rdr.Next() {
-			rec := rdr.Record()
-			for r := 0; r < int(rec.NumRows()); r++ {
-				total++
-				if printed >= maxRows {
-					continue
-				}
-				vals := make([]string, int(rec.NumCols()))
-				for c := 0; c < int(rec.NumCols()); c++ {
-					vals[c] = cell(rec.Column(c), r)
-				}
-				fmt.Fprintln(w, strings.Join(vals, "\t"))
-				printed++
-			}
-		}
-		w.Flush()
-		if total > int64(printed) {
-			fmt.Fprintf(os.Stderr, "… %d rows total (showing %d; pipe or -o to export)\n", total, printed)
-		}
-		return total, rdr.Err()
-	}
-	// pipe: raw Arrow IPC stream — composable with DuckDB, Python, anything
-	wr := ipc.NewWriter(os.Stdout, ipc.WithSchema(rdr.Schema()))
-	defer wr.Close()
-	for rdr.Next() {
-		rec := rdr.Record()
-		total += rec.NumRows()
-		if err := wr.Write(rec); err != nil {
-			return total, err
-		}
-	}
-	return total, rdr.Err()
+var stdoutFormats = map[string]bool{
+	"table": true, "csv": true, "json": true, "jsonl": true, "md": true, "arrow": true,
 }
 
-func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, maxRows int) (int64, error) {
-	var total int64
+type sink struct {
+	format string
+	w      io.Writer
+	closer io.Closer // file to close, nil for stdout
+	path   string    // file path, "" for stdout
+}
+
+// resolveSink maps -o to a format + destination. Bare format name → stdout;
+// anything with an extension → file, format inferred. Empty → TTY table /
+// pipe Arrow IPC (the M0 behavior, unchanged).
+func resolveSink(o string) (sink, error) {
+	if o == "" {
+		if stdoutIsTTY() {
+			return sink{format: "table", w: os.Stdout}, nil
+		}
+		return sink{format: "arrow", w: os.Stdout}, nil
+	}
+	name := strings.ToLower(o)
+	if name == "markdown" {
+		name = "md"
+	}
+	if stdoutFormats[name] && !strings.ContainsAny(o, "./\\") {
+		return sink{format: name, w: os.Stdout}, nil
+	}
+	var format string
+	switch strings.ToLower(strings.TrimPrefix(filepath.Ext(o), ".")) {
+	case "arrow", "arrows", "ipc":
+		format = "arrow"
+	case "parquet", "pq":
+		format = "parquet"
+	case "csv":
+		format = "csv"
+	case "json":
+		format = "json"
+	case "jsonl", "ndjson":
+		format = "jsonl"
+	case "md":
+		format = "md"
+	default:
+		return sink{}, fmt.Errorf("-o: unknown format or extension %q (formats: table csv json jsonl md arrow · files: .arrow .parquet .csv .json .jsonl .md)", o)
+	}
+	f, err := os.Create(o)
+	if err != nil {
+		return sink{}, err
+	}
+	return sink{format: format, w: f, closer: f, path: o}, nil
+}
+
+func mdEscape(vals []string) []string {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = strings.NewReplacer("|", "\\|", "\n", " ").Replace(v)
+	}
+	return out
+}
+
+// recordWriter streams flight record batches into one output format.
+type recordWriter struct {
+	s       sink
+	maxRows int   // >0 caps emitted rows; the stream is still drained for the total
+	total   int64 // rows received
+	written int64 // rows emitted
+	schema  *arrow.Schema
+	tw      *tabwriter.Writer
+	cw      *csv.Writer
+	iw      *ipc.Writer
+	pw      *pqarrow.FileWriter
+	jsonAny bool
+}
+
+func (rw *recordWriter) begin(schema *arrow.Schema) error {
+	rw.schema = schema
+	heads := make([]string, len(schema.Fields()))
+	for i, f := range schema.Fields() {
+		heads[i] = f.Name
+	}
+	switch rw.s.format {
+	case "table":
+		rw.tw = tabwriter.NewWriter(rw.s.w, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(rw.tw, strings.Join(heads, "\t"))
+	case "md":
+		fmt.Fprintln(rw.s.w, "| "+strings.Join(mdEscape(heads), " | ")+" |")
+		sep := make([]string, len(heads))
+		for i := range sep {
+			sep[i] = "---"
+		}
+		fmt.Fprintln(rw.s.w, "| "+strings.Join(sep, " | ")+" |")
+	case "csv":
+		rw.cw = csv.NewWriter(rw.s.w)
+		if err := rw.cw.Write(heads); err != nil {
+			return err
+		}
+	case "json":
+		fmt.Fprint(rw.s.w, "[")
+	case "jsonl":
+	case "arrow":
+		rw.iw = ipc.NewWriter(rw.s.w, ipc.WithSchema(schema))
+	case "parquet":
+		props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+		var err error
+		rw.pw, err = pqarrow.NewFileWriter(schema, rw.s.w, props, pqarrow.DefaultWriterProps())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (rw *recordWriter) write(rec arrow.Record) error {
+	rw.total += rec.NumRows()
+	emit := rec
+	if rw.maxRows > 0 {
+		remain := int64(rw.maxRows) - rw.written
+		if remain <= 0 {
+			return nil // keep draining for the total count
+		}
+		if rec.NumRows() > remain {
+			emit = rec.NewSlice(0, remain)
+			defer emit.Release()
+		}
+	}
+	n := emit.NumRows()
+	switch rw.s.format {
+	case "table", "md", "csv":
+		for r := 0; r < int(n); r++ {
+			vals := make([]string, int(emit.NumCols()))
+			for c := range vals {
+				if rw.s.format == "csv" && emit.Column(c).IsNull(r) {
+					vals[c] = "" // empty cell = NA for pandas/Excel; "NULL" would arrive as a string
+					continue
+				}
+				vals[c] = cell(emit.Column(c), r)
+			}
+			switch rw.s.format {
+			case "table":
+				fmt.Fprintln(rw.tw, strings.Join(vals, "\t"))
+			case "md":
+				fmt.Fprintln(rw.s.w, "| "+strings.Join(mdEscape(vals), " | ")+" |")
+			case "csv":
+				if err := rw.cw.Write(vals); err != nil {
+					return err
+				}
+			}
+		}
+	case "json", "jsonl":
+		var buf bytes.Buffer
+		if err := array.RecordToJSON(emit, &buf); err != nil {
+			return err
+		}
+		for _, ln := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
+			if ln == "" {
+				continue
+			}
+			if rw.s.format == "jsonl" {
+				fmt.Fprintln(rw.s.w, ln)
+			} else {
+				if rw.jsonAny {
+					fmt.Fprint(rw.s.w, ",")
+				}
+				fmt.Fprint(rw.s.w, "\n  "+ln)
+				rw.jsonAny = true
+			}
+		}
+	case "arrow":
+		if err := rw.iw.Write(emit); err != nil {
+			return err
+		}
+	case "parquet":
+		if err := rw.pw.Write(emit); err != nil {
+			return err
+		}
+	}
+	rw.written += n
+	return nil
+}
+
+func (rw *recordWriter) end() error {
+	if rw.schema == nil { // no data ever arrived
+		if rw.s.format == "json" {
+			fmt.Fprintln(rw.s.w, "[]")
+		}
+		return nil
+	}
+	switch rw.s.format {
+	case "table":
+		return rw.tw.Flush()
+	case "csv":
+		rw.cw.Flush()
+		return rw.cw.Error()
+	case "json":
+		if rw.jsonAny {
+			fmt.Fprintln(rw.s.w, "\n]")
+		} else {
+			fmt.Fprintln(rw.s.w, "]")
+		}
+	case "arrow":
+		return rw.iw.Close()
+	case "parquet":
+		return rw.pw.Close()
+	}
+	return nil
+}
+
+func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, s sink, maxRows int) (int64, error) {
+	rw := &recordWriter{s: s, maxRows: maxRows}
 	for _, ep := range info.Endpoint {
 		rdr, err := cl.DoGet(ctx, ep.Ticket)
 		if err != nil {
-			return total, err
+			return rw.total, err
 		}
-		n, err := streamRecords(rdr, maxRows)
+		if rw.schema == nil {
+			if err := rw.begin(rdr.Schema()); err != nil {
+				rdr.Release()
+				return rw.total, err
+			}
+		}
+		for rdr.Next() {
+			if err := rw.write(rdr.Record()); err != nil {
+				rdr.Release()
+				return rw.total, err
+			}
+		}
+		err = rdr.Err()
 		rdr.Release()
-		total += n
 		if err != nil {
-			return total, err
+			return rw.total, err
 		}
 	}
-	return total, nil
+	if err := rw.end(); err != nil {
+		return rw.total, err
+	}
+	// pqarrow's FileWriter.Close() closes the underlying file itself
+	if s.closer != nil && s.format != "parquet" {
+		if err := s.closer.Close(); err != nil {
+			return rw.total, err
+		}
+	}
+	if rw.maxRows > 0 && rw.total > rw.written {
+		fmt.Fprintf(os.Stderr, "… %d rows total (showing %d; use -o or a LIMIT to change)\n", rw.total, rw.written)
+	}
+	return rw.total, nil
+}
+
+// autoMaxRows: table output defaults to a sane terminal cap; every other
+// format emits everything unless --max-rows is given explicitly.
+func autoMaxRows(flagVal int, format string, tableDefault int) int {
+	if flagVal >= 0 {
+		return flagVal
+	}
+	if format == "table" {
+		return tableDefault
+	}
+	return 0
 }
 
 // ── commands ────────────────────────────────────────────────────────────
@@ -312,6 +524,7 @@ func cmdLs(args []string) error {
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	pos := parseFlags(fs, args)
 
 	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
@@ -336,7 +549,11 @@ func cmdLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	_, err = consumeInfo(ctx, cl, info, 1000)
+	s, err := resolveSink(*output)
+	if err != nil {
+		return err
+	}
+	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000))
 	return err
 }
 
@@ -345,10 +562,11 @@ func cmdSQL(args []string) error {
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
-	maxRows := fs.Int("max-rows", 40, "max rows to print on a TTY")
+	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 for table, unlimited otherwise)")
+	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return fmt.Errorf(`usage: sparrow sql "SELECT ..." [-s profile]`)
+		return fmt.Errorf(`usage: sparrow sql "SELECT ..." [-s profile] [-o format|file]`)
 	}
 	query := strings.Join(pos, " ")
 
@@ -369,12 +587,165 @@ func cmdSQL(args []string) error {
 	if err != nil {
 		return err
 	}
-	total, err := consumeInfo(ctx, cl, info, *maxRows)
+	s, err := resolveSink(*output)
 	if err != nil {
 		return err
 	}
-	if stdoutIsTTY() {
+	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40))
+	if err != nil {
+		return err
+	}
+	if s.path != "" {
+		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
+	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
+	}
+	return nil
+}
+
+func groupDigits(s string) string {
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	lead := len(s) % 3
+	if lead > 0 {
+		b.WriteString(s[:lead])
+	}
+	for i := lead; i < len(s); i += 3 {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
+}
+
+func cmdInfo(args []string) error {
+	fs := flag.NewFlagSet("info", flag.ExitOnError)
+	server := fs.String("s", "", "profile name or grpc URI")
+	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	noCount := fs.Bool("no-count", false, "skip the COUNT(*) row estimate")
+	pos := parseFlags(fs, args)
+	if len(pos) < 1 {
+		return fmt.Errorf("usage: sparrow info <table> [-s profile] [--no-count]")
+	}
+	table := pos[0]
+
+	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cl, ctx, err := dial(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	info, err := cl.GetTables(ctx, &flightsql.GetTablesOpts{
+		TableNameFilterPattern: &table,
+		IncludeSchema:          true,
+	})
+	if err != nil {
+		return err
+	}
+	found := false
+	var schema *arrow.Schema
+	for _, ep := range info.Endpoint {
+		rdr, err := cl.DoGet(ctx, ep.Ticket)
+		if err != nil {
+			return err
+		}
+		for rdr.Next() {
+			rec := rdr.Record()
+			idx := map[string]int{}
+			for i, f := range rec.Schema().Fields() {
+				idx[f.Name] = i
+			}
+			for r := 0; r < int(rec.NumRows()); r++ {
+				found = true
+				name := table
+				if i, ok := idx["table_name"]; ok {
+					name = cell(rec.Column(i), r)
+				}
+				fmt.Printf("table: %s", name)
+				if i, ok := idx["table_type"]; ok {
+					fmt.Printf(" (%s)", cell(rec.Column(i), r))
+				}
+				fmt.Println()
+				cat, sch := "", ""
+				if i, ok := idx["catalog_name"]; ok && !rec.Column(i).IsNull(r) {
+					cat = cell(rec.Column(i), r)
+				}
+				if i, ok := idx["db_schema_name"]; ok && !rec.Column(i).IsNull(r) {
+					sch = cell(rec.Column(i), r)
+				}
+				if cat != "" || sch != "" {
+					fmt.Printf("catalog: %s · schema: %s\n", cat, sch)
+				}
+				if i, ok := idx["table_schema"]; ok && !rec.Column(i).IsNull(r) {
+					var b []byte
+					switch col := rec.Column(i).(type) {
+					case *array.Binary:
+						b = col.Value(r)
+					case *array.LargeBinary:
+						b = col.Value(r)
+					}
+					if b != nil {
+						if sc, err := flight.DeserializeSchema(b, memory.DefaultAllocator); err == nil {
+							schema = sc
+						}
+					}
+				}
+			}
+		}
+		err = rdr.Err()
+		rdr.Release()
+		if err != nil {
+			return err
+		}
+	}
+	if !found {
+		return fmt.Errorf("no table matching %q (try: sparrow ls)", table)
+	}
+	if schema == nil {
+		// server sent no embedded schema — probe with LIMIT 0
+		if info, err := cl.Execute(ctx, "SELECT * FROM "+table+" LIMIT 0"); err == nil {
+			if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err == nil {
+				schema = rdr.Schema()
+				for rdr.Next() {
+				}
+				rdr.Release()
+			}
+		}
+	}
+	if schema != nil {
+		fmt.Println("columns:")
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		for _, f := range schema.Fields() {
+			null := ""
+			if f.Nullable {
+				null = "nullable"
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\n", f.Name, f.Type, null)
+		}
+		w.Flush()
+	}
+	if !*noCount {
+		if info, err := cl.Execute(ctx, "SELECT COUNT(*) FROM "+table); err == nil {
+			if rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket); err == nil {
+				for rdr.Next() {
+					rec := rdr.Record()
+					if rec.NumRows() > 0 && rec.NumCols() > 0 {
+						fmt.Printf("rows: %s\n", groupDigits(cell(rec.Column(0), 0)))
+					}
+				}
+				rdr.Release()
+			}
+		}
 	}
 	return nil
 }
@@ -409,12 +780,16 @@ func usage() {
 
 usage:
   sparrow connect <grpc[+tls]://host:port> [--basic user:pass] [--tls-skip-verify] [--name p]
-  sparrow ls [pattern] [-s profile]
-  sparrow sql "SELECT ..." [-s profile] [--max-rows N]
+  sparrow ls [pattern] [-s profile] [-o format]
+  sparrow info <table> [-s profile] [--no-count]
+  sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N]
   sparrow profiles
   sparrow version
 
-On a TTY, results print as a table. In a pipe, results stream as raw Arrow IPC.`)
+output (-o): table · csv · json · jsonl · md · arrow — or a file path:
+  data.parquet · data.csv · data.json · data.jsonl · data.arrow · data.md
+Defaults: a TTY gets a table; a pipe streams raw Arrow IPC (composable with
+DuckDB, Python, anything). Agents and scripts: use -o md, -o jsonl or -o csv.`)
 }
 
 func main() {
@@ -428,6 +803,8 @@ func main() {
 		err = cmdConnect(os.Args[2:])
 	case "ls":
 		err = cmdLs(os.Args[2:])
+	case "info":
+		err = cmdInfo(os.Args[2:])
 	case "sql":
 		err = cmdSQL(os.Args[2:])
 	case "profiles":

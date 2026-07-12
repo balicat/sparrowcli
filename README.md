@@ -1,51 +1,97 @@
 # sparrow
 
-Arrow Flight data. At the speed of the command line.
+**A terminal client for any Apache Arrow Flight / Flight SQL server.**
+One static binary: browse the catalog, run SQL, stream Arrow onward.
+Human-friendly on a TTY, machine-friendly in a pipe, **agent-friendly by design**.
 
-A single binary that talks to **any Arrow Flight SQL server** — browse the catalog,
-run SQL, stream Arrow onward. Human-friendly on a TTY, machine-friendly in a pipe.
+> **Status** &nbsp; ✔ works against four independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
+> **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS*
 
-Part of the [Sparrow](https://sparrowflight.io) family · spec: [sparrowflight.io/cli](https://sparrowflight.io/cli)
+```sh
+# a live 136-million-row Flight SQL server, open for exactly this:
+sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:demo
 
-## Usage
-
-```
-$ sparrow connect grpc+tls://host:31337 --basic user:pass --tls-skip-verify --name gizmo
-✓ connected in 8 ms — gizmosql duckdb v1.5.4
-✓ saved profile "gizmo" (default: gizmo)
-
-$ sparrow ls
-catalog_name  db_schema_name  table_name  table_type
-memory        main            prices      BASE TABLE
-
-$ sparrow sql "SELECT * FROM prices LIMIT 4"
-day_no  wti
-0       70
-1       70.3
-2       70.6
-3       70.9
-✓ 4 rows in 35 ms
-
-# In a pipe, output is a raw Arrow IPC stream — composable with anything:
-$ sparrow sql "SELECT * FROM prices" > prices.arrows
-$ python -c "import pyarrow.ipc as ipc; print(ipc.open_stream('prices.arrows').read_all())"
+sparrow ls
+sparrow info series_data
+sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 ```
 
-## Status: M0
+## Commands
 
-- `connect` — header/handshake Basic auth, TLS with `--tls-skip-verify` for
-  self-signed certs, vendor probe (GetSqlInfo with `SELECT 1` fallback), saved profiles
-- `ls` — catalog via the **GetTables RPC** (portable across every server we tested;
-  see the [dialect matrix](https://sparrowflight.io/cli))
-- `sql` — `CommandStatementQuery` → `GetFlightInfo` → `DoGet`, streamed
-- Output contract: aligned table on a TTY, **raw Arrow IPC on stdout in a pipe**
+| command | does | wire calls |
+|---|---|---|
+| `sparrow connect <uri>` | verify + save a profile | vendor probe via `GetSqlInfo`, `SELECT 1` fallback |
+| `sparrow ls [pattern]` | list tables | `GetTables` — the one discovery RPC that works everywhere |
+| `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
+| `sparrow sql "<query>"` | run a statement | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow profiles` | list saved connections | — |
 
-Validated against GizmoSQL (DuckDB engine) from Linux and Windows.
-Next (M1): `-o file.{arrow,parquet,csv,json}`, InfluxDB 3 bearer+header auth, Dremio quirks.
+Auth: `--basic user:pass` (API key as user works; Bearer handoff adopted
+automatically, GizmoSQL-style). TLS: `grpc://` plain, `grpc+tls://` verified,
+`--tls-skip-verify` for self-signed.
 
-## Build
+## Output — pick your consumer
 
+```sh
+sparrow sql "..."                    # TTY: aligned table · pipe: raw Arrow IPC
+sparrow sql "..." -o md              # markdown table
+sparrow sql "..." -o csv             # CSV (empty cell = NULL)
+sparrow sql "..." -o jsonl           # one JSON object per row
+sparrow sql "..." -o json            # JSON array
+sparrow sql "..." -o data.parquet    # file sink: .parquet .csv .json .jsonl .arrow .md
 ```
-go build -o sparrow .        # needs Go >= 1.25 (arrow-go v18.6)
+
+**In a pipe, the default is a raw Arrow IPC stream** — columnar data stays
+columnar all the way:
+
+```sh
+sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
+  | duckdb -c "SELECT MAX(value) FROM read_arrow('/dev/stdin')"
+```
+
+## For AI agents (Claude Code, etc.)
+
+This CLI is how an agent looks at a Flight server without writing a client.
+Three commands orient it completely; `-o md` returns tables it can read
+natively:
+
+```sh
+sparrow ls -o md                 # what tables exist
+sparrow info series_data         # schema + row count
+sparrow sql "SELECT ... LIMIT 20" -o md   # readable results
+```
+
+Conventions agents can rely on:
+
+- `-o md` / `-o jsonl` / `-o csv` are stable, parseable stdout formats — no
+  ANSI, no decoration; row-count and timing summaries go to **stderr**.
+- Exit codes: `0` ok · `1` query/connection error · `3` usage.
+- `--max-rows N` caps emitted rows (the total still reports on stderr).
+  Prefer `LIMIT` in SQL — `--max-rows` still downloads the full result.
+- Profiles live in `~/.sparrow/config.json`; `-s <profile>` selects one,
+  `-s grpc+tls://host:port --basic u:p` works ad-hoc.
+
+## Build from source
+
+```sh
+go build -o sparrow .        # Go ≥ 1.25; pure Go, no cgo — trivially cross-compiles
 GOOS=windows go build -o sparrow.exe .
 ```
+
+## The Sparrow family
+
+One transport, many clients: [Sparrow](https://sparrowflight.io) (the Flight
+server) · [sparrowJS](https://github.com/balicat/sparrowjs) (the browser) ·
+[sparrowXL](https://sparrowflight.io/excel) (Excel) ·
+[sparrowMCP](https://sparrowflight.io/mcp) (AI agents) · **sparrowCLI** (the
+terminal).
+
+---
+
+\* Dremio: connect/ls/sql validated 2026-07-09 via the same auth + discovery
+path (see [sparrowflight.io/cli](https://sparrowflight.io/cli)); its SQL
+dialect quirks are its own business — your SQL passes through untouched.
+
+## License
+
+[Apache-2.0](LICENSE)
