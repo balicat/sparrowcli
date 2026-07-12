@@ -124,8 +124,7 @@ Conventions agents can rely on:
 
 ## The landscape (as of July 2026)
 
-Other CLIs can reach a Flight SQL server — none keep the data columnar on the
-way through:
+Other CLIs can reach a Flight SQL server — none preserve Arrow end-to-end:
 
 | | scope | Arrow stays Arrow? |
 |---|---|---|
@@ -133,7 +132,7 @@ way through:
 | [`timvw/arrow-flight-sql-client`](https://github.com/timvw/arrow-flight-sql-client) | any Flight SQL server | ✗ — small RPC-mirror CLI, text out |
 | [`usql`](https://github.com/xo/usql) | 40+ databases; Flight SQL as one driver | ✗ — excellent universal shell, but results flatten through `database/sql` to rows and text |
 | `bendsql` (né "Arrow CLI") | Databend only | — what happens when an Arrow CLI grows up inside one vendor |
-| **`sparrow`** | **any Flight SQL server** | **✓ — raw Arrow IPC in a pipe, parquet sinks, typed formats** |
+| **`sparrow`** | **any Flight SQL server** | **✓ — columnar from Flight server to downstream process: raw IPC pipe, parquet sinks, typed formats** |
 
 The gap sparrow fills isn't "a CLI exists" — it's Arrow-native ergonomics:
 catalog discovery over the Flight RPCs, profiles, `orient`, output that follows
