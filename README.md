@@ -11,13 +11,16 @@ Arrow IPC when you're piping — the same command does both.**
 > **Status** &nbsp; ✔ works against five independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
 > **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS &nbsp; ✔ InfluxDB 3 Core
 
+## Quick start — four commands
+
 ```sh
 # a live 136-million-row Flight SQL server, open for exactly this:
 sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:demo
 
 sparrow ls
-sparrow info series_data
 sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
+sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
+  | duckdb -c "SELECT MAX(value) FROM read_arrow('/dev/stdin')"
 ```
 
 ## Commands
@@ -40,9 +43,9 @@ Auth — the two adapters that cover the whole tested landscape:
 ```
 
 TLS: `grpc://` plain, `grpc+tls://` verified, `--tls-skip-verify` for
-self-signed. The vendor fingerprint tries `GetSqlInfo`, then `SELECT version()`
-(Dremio answers the second, InfluxDB the first — between them, every server
-identifies itself).
+self-signed. The CLI identifies the server by trying `GetSqlInfo` first, then
+`SELECT version()` as a fallback — Dremio answers the second, InfluxDB the
+first; between them, every server identifies itself.
 
 ## Output — pick your consumer
 
@@ -82,7 +85,7 @@ cert → refused (exit 2); cert → query runs.
 ## For AI agents (Claude Code, etc.)
 
 AI agents don't need a Flight client library — they can just call the CLI.
-**One command maps any Flight server** — vendor, tables, schemas, as markdown:
+**One command maps a Flight server** — vendor, tables, schemas, as markdown:
 
 ```sh
 sparrow orient
