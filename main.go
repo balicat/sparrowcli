@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,7 +37,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -47,6 +49,9 @@ type Profile struct {
 	Token         string            `json:"token,omitempty"`   // bearer auth (InfluxDB 3 style)
 	Headers       map[string]string `json:"headers,omitempty"` // extra per-call metadata (e.g. database: mydb)
 	TLSSkipVerify bool              `json:"tls_skip_verify,omitempty"`
+	TLSCert       string            `json:"tls_cert,omitempty"` // client certificate (mTLS), PEM path
+	TLSKey        string            `json:"tls_key,omitempty"`  // client private key (mTLS), PEM path
+	TLSCA         string            `json:"tls_ca,omitempty"`   // CA bundle to verify the server, PEM path
 }
 
 type Config struct {
@@ -108,9 +113,28 @@ func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, e
 	}
 	var creds grpc.DialOption
 	if useTLS {
-		creds = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+		tc := &tls.Config{
 			InsecureSkipVerify: p.TLSSkipVerify, // GizmoSQL ships self-signed by default
-		}))
+		}
+		if p.TLSCert != "" || p.TLSKey != "" {
+			pair, err := tls.LoadX509KeyPair(p.TLSCert, p.TLSKey)
+			if err != nil {
+				return nil, ctx, connError{fmt.Errorf("mTLS keypair: %w", err)}
+			}
+			tc.Certificates = []tls.Certificate{pair}
+		}
+		if p.TLSCA != "" {
+			pem, err := os.ReadFile(p.TLSCA)
+			if err != nil {
+				return nil, ctx, connError{fmt.Errorf("tls-ca: %w", err)}
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, ctx, connError{fmt.Errorf("tls-ca: no PEM certificates in %s", p.TLSCA)}
+			}
+			tc.RootCAs = pool
+		}
+		creds = grpc.WithTransportCredentials(credentials.NewTLS(tc))
 	} else {
 		creds = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
@@ -162,8 +186,50 @@ func parseHeaders(hs []string) (map[string]string, error) {
 	return out, nil
 }
 
+// connFlags registers the connection flags shared by every data command and
+// resolves them to a profile (saved profile via -s, or an ad-hoc URI).
+type connFlags struct {
+	server, basic, bearer *string
+	cert, key, ca         *string
+	tlsSkip               *bool
+	hdrs                  multiFlag
+}
+
+func addConnFlags(fs *flag.FlagSet) *connFlags {
+	cf := &connFlags{}
+	cf.server = fs.String("s", "", "profile name or grpc URI")
+	cf.basic = fs.String("basic", "", "user:pass for ad-hoc URIs")
+	cf.bearer = fs.String("bearer", "", "bearer token for ad-hoc URIs")
+	fs.Var(&cf.hdrs, "header", "extra per-call metadata key=value (repeatable)")
+	cf.tlsSkip = fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cf.cert = fs.String("tls-cert", "", "client certificate for mTLS (PEM path)")
+	cf.key = fs.String("tls-key", "", "client private key for mTLS (PEM path)")
+	cf.ca = fs.String("tls-ca", "", "CA bundle to verify the server (PEM path)")
+	return cf
+}
+
+func (cf *connFlags) resolve() (Profile, string, error) {
+	adhoc := Profile{
+		Auth: "none", TLSSkipVerify: *cf.tlsSkip,
+		TLSCert: *cf.cert, TLSKey: *cf.key, TLSCA: *cf.ca,
+	}
+	if *cf.basic != "" {
+		u, pw, _ := strings.Cut(*cf.basic, ":")
+		adhoc.Auth, adhoc.User, adhoc.Pass = "basic", u, pw
+	}
+	if *cf.bearer != "" {
+		adhoc.Auth, adhoc.Token = "bearer", *cf.bearer
+	}
+	h, err := parseHeaders(cf.hdrs)
+	if err != nil {
+		return Profile{}, "", err
+	}
+	adhoc.Headers = h
+	return resolveProfile(*cf.server, adhoc)
+}
+
 // resolveProfile picks the connection: -s <profile|uri>, else the default profile.
-func resolveProfile(server, basic, bearer string, headers []string, tlsSkip bool) (Profile, string, error) {
+func resolveProfile(server string, adhoc Profile) (Profile, string, error) {
 	cfg := loadConfig()
 	name := server
 	if name == "" {
@@ -173,20 +239,8 @@ func resolveProfile(server, basic, bearer string, headers []string, tlsSkip bool
 		return p, name, nil
 	}
 	if strings.Contains(server, "://") { // ad-hoc URI
-		p := Profile{URI: server, Auth: "none", TLSSkipVerify: tlsSkip}
-		if basic != "" {
-			u, pw, _ := strings.Cut(basic, ":")
-			p.Auth, p.User, p.Pass = "basic", u, pw
-		}
-		if bearer != "" {
-			p.Auth, p.Token = "bearer", bearer
-		}
-		h, err := parseHeaders(headers)
-		if err != nil {
-			return Profile{}, "", err
-		}
-		p.Headers = h
-		return p, "(ad-hoc)", nil
+		adhoc.URI = server
+		return adhoc, "(ad-hoc)", nil
 	}
 	if server == "" && cfg.Default == "" {
 		return Profile{}, "", connError{fmt.Errorf("no default profile — run: sparrow connect <uri> [--basic user:pass]")}
@@ -225,6 +279,39 @@ type sink struct {
 	w      io.Writer
 	closer io.Closer // file to close, nil for stdout
 	path   string    // file path, "" for stdout
+	encKey []byte    // parquet only: Parquet Modular Encryption footer key
+}
+
+// loadKey parses --encrypt-key: a hex string, env:VAR (hex), or file:path
+// (hex text or raw bytes). AES wants 16, 24 or 32 bytes.
+func loadKey(spec string) ([]byte, error) {
+	hexStr := spec
+	switch {
+	case strings.HasPrefix(spec, "env:"):
+		hexStr = os.Getenv(spec[4:])
+		if hexStr == "" {
+			return nil, fmt.Errorf("--encrypt-key: environment variable %s is empty", spec[4:])
+		}
+	case strings.HasPrefix(spec, "file:"):
+		b, err := os.ReadFile(spec[5:])
+		if err != nil {
+			return nil, fmt.Errorf("--encrypt-key: %w", err)
+		}
+		switch len(b) {
+		case 16, 24, 32: // raw key bytes
+			return b, nil
+		}
+		hexStr = strings.TrimSpace(string(b))
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(hexStr))
+	if err != nil {
+		return nil, fmt.Errorf("--encrypt-key: not valid hex (use hex, env:VAR or file:path): %w", err)
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return key, nil
+	}
+	return nil, fmt.Errorf("--encrypt-key: AES wants 16, 24 or 32 bytes (got %d)", len(key))
 }
 
 // resolveSink maps -o to a format + destination. Bare format name → stdout;
@@ -318,7 +405,14 @@ func (rw *recordWriter) begin(schema *arrow.Schema) error {
 	case "arrow":
 		rw.iw = ipc.NewWriter(rw.s.w, ipc.WithSchema(schema))
 	case "parquet":
-		props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+		opts := []parquet.WriterProperty{parquet.WithCompression(compress.Codecs.Snappy)}
+		if len(rw.s.encKey) > 0 {
+			// Parquet Modular Encryption (AES-GCM, encrypted footer) — the
+			// in-spec, cross-tool format; DuckDB/Spark/pyarrow read it back
+			opts = append(opts, parquet.WithEncryptionProperties(
+				parquet.NewFileEncryptionProperties(string(rw.s.encKey))))
+		}
+		props := parquet.NewWriterProperties(opts...)
 		var err error
 		rw.pw, err = pqarrow.NewFileWriter(schema, rw.s.w, props, pqarrow.DefaultWriterProps())
 		if err != nil {
@@ -519,12 +613,16 @@ example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:dem
 	var hdrs multiFlag
 	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable; e.g. --header database=mydb)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cert := fs.String("tls-cert", "", "client certificate for mTLS (PEM path)")
+	key := fs.String("tls-key", "", "client private key for mTLS (PEM path)")
+	ca := fs.String("tls-ca", "", "CA bundle to verify the server (PEM path)")
 	name := fs.String("name", "default", "profile name")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass | --bearer TOKEN] [--header k=v] [--tls-skip-verify] [--name profile]")
+		return fmt.Errorf("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass | --bearer TOKEN] [--header k=v] [--tls-cert/--tls-key/--tls-ca …] [--name profile]")
 	}
-	p := Profile{URI: pos[0], Auth: "none", TLSSkipVerify: *tlsSkip}
+	p := Profile{URI: pos[0], Auth: "none", TLSSkipVerify: *tlsSkip,
+		TLSCert: *cert, TLSKey: *key, TLSCA: *ca}
 	if *basic != "" {
 		u, pw, _ := strings.Cut(*basic, ":")
 		p.Auth, p.User, p.Pass = "basic", u, pw
@@ -583,16 +681,11 @@ func cmdLs(args []string) error {
 	fs := newFlagSet("ls", `usage: sparrow ls [pattern] [flags]
 list tables via the GetTables RPC (works identically on every Flight SQL server)
 example: sparrow ls -o md`)
-	server := fs.String("s", "", "profile name or grpc URI")
-	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
-	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
-	var hdrs multiFlag
-	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
-	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	pos := parseFlags(fs, args)
 
-	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
+	p, _, err := cf.resolve()
 	if err != nil {
 		return err
 	}
@@ -628,15 +721,11 @@ run a Flight SQL statement; -o picks the output format or file
 examples: sparrow sql "SELECT 42 AS x" -o md
           sparrow sql "SELECT * FROM t" -o data.parquet
           sparrow sql "SELECT * FROM t" | duckdb   (pipe = raw Arrow IPC)`)
-	server := fs.String("s", "", "profile name or grpc URI")
-	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
-	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
-	var hdrs multiFlag
-	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
-	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cf := addConnFlags(fs)
 	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 table, 1000 md, unlimited otherwise)")
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	file := fs.String("f", "", "read the SQL from a file")
+	encKey := fs.String("encrypt-key", "", "encrypt parquet output (Parquet Modular Encryption): hex, env:VAR or file:path")
 	pos := parseFlags(fs, args)
 	var query string
 	switch {
@@ -659,7 +748,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		return fmt.Errorf(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
-	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
+	p, _, err := cf.resolve()
 	if err != nil {
 		return err
 	}
@@ -679,6 +768,16 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	s, err := resolveSink(*output)
 	if err != nil {
 		return err
+	}
+	if *encKey != "" {
+		if s.format != "parquet" {
+			return fmt.Errorf("--encrypt-key only applies to parquet output (-o data.parquet)")
+		}
+		k, err := loadKey(*encKey)
+		if err != nil {
+			return err
+		}
+		s.encKey = k
 	}
 	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40))
 	if err != nil {
@@ -742,15 +841,10 @@ func cmdOrient(args []string) error {
 	fs := newFlagSet("orient", `usage: sparrow orient [flags]
 one-shot markdown orientation: server vendor, every table, every schema
 example: sparrow orient -s gizmo`)
-	server := fs.String("s", "", "profile name or grpc URI")
-	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
-	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
-	var hdrs multiFlag
-	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
-	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cf := addConnFlags(fs)
 	parseFlags(fs, args)
 
-	p, pname, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
+	p, pname, err := cf.resolve()
 	if err != nil {
 		return err
 	}
@@ -877,12 +971,7 @@ func cmdInfo(args []string) error {
 	fs := newFlagSet("info", `usage: sparrow info <table> [flags]
 show a table's schema, catalog and row count before pulling anything
 example: sparrow info series_data`)
-	server := fs.String("s", "", "profile name or grpc URI")
-	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
-	bearer := fs.String("bearer", "", "bearer token for ad-hoc URIs")
-	var hdrs multiFlag
-	fs.Var(&hdrs, "header", "extra per-call metadata key=value (repeatable)")
-	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	cf := addConnFlags(fs)
 	noCount := fs.Bool("no-count", false, "skip the COUNT(*) row estimate")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
@@ -890,7 +979,7 @@ example: sparrow info series_data`)
 	}
 	table := pos[0]
 
-	p, _, err := resolveProfile(*server, *basic, *bearer, hdrs, *tlsSkip)
+	p, _, err := cf.resolve()
 	if err != nil {
 		return err
 	}
@@ -1088,6 +1177,9 @@ output (-o): table · csv · json · jsonl · md · arrow — or a file path:
   data.parquet · data.csv · data.json · data.jsonl · data.arrow · data.md
 Defaults: a TTY gets a table; a pipe streams raw Arrow IPC (composable with
 DuckDB, Python, anything). Agents and scripts: use -o md, -o jsonl or -o csv.
+Security: --tls-ca / --tls-cert / --tls-key for private CAs and mTLS;
+  sql --encrypt-key <hex|env:VAR|file:path> seals parquet output (in-spec
+  Parquet Modular Encryption — DuckDB/Spark/pyarrow read it back with the key).
 Exit codes: 0 ok · 1 query error · 2 connection/auth · 3 usage.`)
 }
 

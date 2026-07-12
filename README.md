@@ -63,6 +63,22 @@ sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
   | duckdb -c "SELECT MAX(value) FROM read_arrow('/dev/stdin')"
 ```
 
+## Security
+
+```sh
+# private CA + mTLS — for Flight deployments that require client certificates
+sparrow connect grpc+tls://flight.corp:443 \
+  --tls-ca ca.crt --tls-cert client.crt --tls-key client.key
+
+# sealed exports — in-spec Parquet Modular Encryption (AES-GCM)
+sparrow sql "SELECT ..." -o data.parquet --encrypt-key env:SPARROW_KEY
+```
+
+The encryption key is hex (16/24/32 bytes), `env:VAR`, or `file:path`.
+DuckDB, Spark and pyarrow read the file back with the key — and refuse it
+without. Verified against an Envoy that requires client certificates: no
+cert → refused (exit 2); cert → query runs.
+
 ## For AI agents (Claude Code, etc.)
 
 AI agents don't need a Flight client library — they can just call the CLI.
