@@ -8,7 +8,7 @@ Most Flight servers ship SDKs. Sometimes you just want to inspect one from a
 terminal. And the pipe is first-class: **a table when you're reading, raw
 Arrow IPC when you're piping — the same command does both.**
 
-> **Status** &nbsp; ✔ works against five independent Flight SQL servers &nbsp;·&nbsp; ⚠ pre-release, no binaries published yet
+> **Status** &nbsp; ✔ works against five independent Flight SQL servers &nbsp;·&nbsp; ✔ [binaries for Linux · macOS · Windows](https://github.com/balicat/sparrowcli/releases)
 > **Validated against** &nbsp; ✔ GizmoSQL (DuckDB) &nbsp; ✔ Sparrow Flight &nbsp; ✔ ROAPI (DataFusion) &nbsp; ✔ Dremio OSS &nbsp; ✔ InfluxDB 3 Core
 
 ## Quick start — four commands
@@ -112,7 +112,13 @@ Conventions agents can rely on:
 - Profiles live in `~/.sparrow/config.json`; `sparrow profiles use <name>`
   switches the default, `-s grpc+tls://host:port --basic u:p` works ad-hoc.
 
-## Build from source
+## Install
+
+Grab a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
+— Linux, macOS and Windows, amd64 + arm64 — unpack, and put `sparrow` on your
+PATH. Checksums included.
+
+Or build from source:
 
 ```sh
 go build -o sparrow .        # Go ≥ 1.25; pure Go, no cgo — trivially cross-compiles
