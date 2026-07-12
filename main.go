@@ -423,6 +423,18 @@ func autoMaxRows(flagVal int, format string, tableDefault int) int {
 
 // ── commands ────────────────────────────────────────────────────────────
 
+// newFlagSet builds a FlagSet whose -h/--help shows the command's own usage
+// line and example, not just bare flag defaults.
+func newFlagSet(name, usage string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, usage)
+		fmt.Fprintln(os.Stderr, "flags:")
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
 // parseFlags handles flags and positionals in any order (stdlib flag stops
 // at the first positional, which surprises everyone eventually).
 func parseFlags(fs *flag.FlagSet, args []string) []string {
@@ -440,7 +452,9 @@ func parseFlags(fs *flag.FlagSet, args []string) []string {
 }
 
 func cmdConnect(args []string) error {
-	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	fs := newFlagSet("connect", `usage: sparrow connect <grpc[+tls]://host:port> [flags]
+verify a Flight SQL server and save it as a profile (the first becomes default)
+example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:demo`)
 	basic := fs.String("basic", "", "user:pass (API key as user is fine)")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
 	name := fs.String("name", "default", "profile name")
@@ -526,7 +540,9 @@ func cmdConnect(args []string) error {
 }
 
 func cmdLs(args []string) error {
-	fs := flag.NewFlagSet("ls", flag.ExitOnError)
+	fs := newFlagSet("ls", `usage: sparrow ls [pattern] [flags]
+list tables via the GetTables RPC (works identically on every Flight SQL server)
+example: sparrow ls -o md`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
@@ -564,7 +580,11 @@ func cmdLs(args []string) error {
 }
 
 func cmdSQL(args []string) error {
-	fs := flag.NewFlagSet("sql", flag.ExitOnError)
+	fs := newFlagSet("sql", `usage: sparrow sql "SELECT ..." [flags]
+run a Flight SQL statement; -o picks the output format or file
+examples: sparrow sql "SELECT 42 AS x" -o md
+          sparrow sql "SELECT * FROM t" -o data.parquet
+          sparrow sql "SELECT * FROM t" | duckdb   (pipe = raw Arrow IPC)`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
@@ -628,7 +648,9 @@ func groupDigits(s string) string {
 }
 
 func cmdInfo(args []string) error {
-	fs := flag.NewFlagSet("info", flag.ExitOnError)
+	fs := newFlagSet("info", `usage: sparrow info <table> [flags]
+show a table's schema, catalog and row count before pulling anything
+example: sparrow info series_data`)
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
@@ -818,6 +840,22 @@ func main() {
 	case "version":
 		fmt.Println("sparrow", version)
 	case "help", "-h", "--help":
+		// "sparrow help <command>" → that command's own -h
+		if len(os.Args) > 2 {
+			switch os.Args[2] {
+			case "connect":
+				err = cmdConnect([]string{"-h"})
+			case "ls":
+				err = cmdLs([]string{"-h"})
+			case "info":
+				err = cmdInfo([]string{"-h"})
+			case "sql":
+				err = cmdSQL([]string{"-h"})
+			default:
+				usage()
+			}
+			break
+		}
 		usage()
 	default:
 		usage()
