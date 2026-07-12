@@ -61,8 +61,10 @@ sparrow sql "..." -o data.parquet    # file sink: .parquet .csv .json .jsonl .ar
 columnar all the way:
 
 ```sh
-sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
-  | duckdb -c "SELECT MAX(value) FROM read_arrow('/dev/stdin')"
+sparrow sql "SELECT period, value FROM series_data WHERE series_id='PET.RWTC.D'" \
+  | duckdb -c "SELECT COUNT(*), MIN(value), MAX(value) FROM read_arrow('/dev/stdin')"
+# → 10217 · -36.98 · 145.31 — forty years of WTI without leaving Arrow
+# (one-time setup: duckdb -c "INSTALL arrow FROM community")
 ```
 
 ## Security
