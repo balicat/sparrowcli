@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,11 +28,13 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
-const version = "0.1.0-m1"
+const version = "0.2.0"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -75,6 +78,13 @@ func saveConfig(cfg Config) error {
 
 // ── connection ──────────────────────────────────────────────────────────
 
+// connError marks connection/auth failures so main can exit 2 (vs 1 for
+// query errors) — lets scripts and agents branch on the failure class.
+type connError struct{ err error }
+
+func (e connError) Error() string { return e.err.Error() }
+func (e connError) Unwrap() error { return e.err }
+
 func parseURI(uri string) (target string, useTLS bool, err error) {
 	switch {
 	case strings.HasPrefix(uri, "grpc+tls://"):
@@ -91,7 +101,7 @@ func parseURI(uri string) (target string, useTLS bool, err error) {
 func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, error) {
 	target, useTLS, err := parseURI(p.URI)
 	if err != nil {
-		return nil, ctx, err
+		return nil, ctx, connError{err}
 	}
 	var creds grpc.DialOption
 	if useTLS {
@@ -103,13 +113,13 @@ func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, e
 	}
 	cl, err := flightsql.NewClient(target, nil, nil, creds)
 	if err != nil {
-		return nil, ctx, err
+		return nil, ctx, connError{err}
 	}
 	if p.Auth == "basic" {
 		authCtx, err := cl.Client.AuthenticateBasicToken(ctx, p.User, p.Pass)
 		if err != nil {
 			cl.Close()
-			return nil, ctx, fmt.Errorf("auth failed: %w", err)
+			return nil, ctx, connError{fmt.Errorf("auth failed: %w", err)}
 		}
 		return cl, authCtx, nil
 	}
@@ -135,9 +145,9 @@ func resolveProfile(server, basic string, tlsSkip bool) (Profile, string, error)
 		return p, "(ad-hoc)", nil
 	}
 	if server == "" && cfg.Default == "" {
-		return Profile{}, "", fmt.Errorf("no default profile — run: sparrow connect <uri> [--basic user:pass]")
+		return Profile{}, "", connError{fmt.Errorf("no default profile — run: sparrow connect <uri> [--basic user:pass]")}
 	}
-	return Profile{}, "", fmt.Errorf("unknown profile %q", name)
+	return Profile{}, "", connError{fmt.Errorf("unknown profile %q (see: sparrow profiles)", name)}
 }
 
 // ── output ──────────────────────────────────────────────────────────────
@@ -409,14 +419,19 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 	return rw.total, nil
 }
 
-// autoMaxRows: table output defaults to a sane terminal cap; every other
-// format emits everything unless --max-rows is given explicitly.
+// autoMaxRows: the reading formats default to sane caps — table for terminal
+// height, md so an agent's careless SELECT * can't flood its own context.
+// Data formats (csv/json/jsonl/arrow/parquet) emit everything unless
+// --max-rows is given explicitly; the true total always reports on stderr.
 func autoMaxRows(flagVal int, format string, tableDefault int) int {
 	if flagVal >= 0 {
 		return flagVal
 	}
-	if format == "table" {
+	switch format {
+	case "table":
 		return tableDefault
+	case "md":
+		return 1000
 	}
 	return 0
 }
@@ -588,13 +603,30 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	server := fs.String("s", "", "profile name or grpc URI")
 	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
 	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
-	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 for table, unlimited otherwise)")
+	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 table, 1000 md, unlimited otherwise)")
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
+	file := fs.String("f", "", "read the SQL from a file")
 	pos := parseFlags(fs, args)
-	if len(pos) < 1 {
-		return fmt.Errorf(`usage: sparrow sql "SELECT ..." [-s profile] [-o format|file]`)
+	var query string
+	switch {
+	case *file != "":
+		b, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		query = string(b)
+	case len(pos) == 1 && pos[0] == "-":
+		// SQL on stdin — no shell-quoting battles for long statements
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		query = string(b)
+	case len(pos) >= 1:
+		query = strings.Join(pos, " ")
+	default:
+		return fmt.Errorf(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
-	query := strings.Join(pos, " ")
 
 	p, _, err := resolveProfile(*server, *basic, *tlsSkip)
 	if err != nil {
@@ -626,6 +658,152 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
 	}
+	return nil
+}
+
+// probeVendor asks GetSqlInfo for SERVER_NAME + SERVER_VERSION; empty string
+// if the server doesn't support it (Dremio errors on GetSqlInfo).
+func probeVendor(ctx context.Context, cl *flightsql.Client) string {
+	info, err := cl.GetSqlInfo(ctx, []flightsql.SqlInfo{
+		flightsql.SqlInfoFlightSqlServerName, flightsql.SqlInfoFlightSqlServerVersion,
+	})
+	if err != nil {
+		return ""
+	}
+	rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	if err != nil {
+		return ""
+	}
+	defer rdr.Release()
+	vals := []string{}
+	for rdr.Next() {
+		rec := rdr.Record()
+		if rec.NumCols() >= 2 {
+			for r := 0; r < int(rec.NumRows()); r++ {
+				switch cell(rec.Column(0), r) {
+				case "0", "1":
+					vals = append(vals, cell(rec.Column(1), r))
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(vals, " "))
+}
+
+// cmdOrient prints a one-shot markdown orientation: vendor, every table,
+// every schema. Designed so a single command tells an AI agent (or a human
+// meeting a server for the first time) everything it needs to start querying.
+func cmdOrient(args []string) error {
+	fs := newFlagSet("orient", `usage: sparrow orient [flags]
+one-shot markdown orientation: server vendor, every table, every schema
+example: sparrow orient -s gizmo`)
+	server := fs.String("s", "", "profile name or grpc URI")
+	basic := fs.String("basic", "", "user:pass for ad-hoc URIs")
+	tlsSkip := fs.Bool("tls-skip-verify", false, "accept self-signed TLS certs")
+	parseFlags(fs, args)
+
+	p, pname, err := resolveProfile(*server, *basic, *tlsSkip)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cl, ctx, err := dial(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	vendor := probeVendor(ctx, cl)
+	if vendor == "" {
+		vendor = "Flight SQL server (vendor info unsupported)"
+	}
+	fmt.Printf("# %s\n\n", vendor)
+	fmt.Printf("endpoint: `%s` (profile: %s)\n\n", p.URI, pname)
+
+	info, err := cl.GetTables(ctx, &flightsql.GetTablesOpts{IncludeSchema: true})
+	if err != nil {
+		return err
+	}
+	type tbl struct {
+		catalog, schema, name, typ string
+		arrow                      *arrow.Schema
+	}
+	var tables []tbl
+	for _, ep := range info.Endpoint {
+		rdr, err := cl.DoGet(ctx, ep.Ticket)
+		if err != nil {
+			return err
+		}
+		for rdr.Next() {
+			rec := rdr.Record()
+			idx := map[string]int{}
+			for i, f := range rec.Schema().Fields() {
+				idx[f.Name] = i
+			}
+			get := func(col string, r int) string {
+				i, ok := idx[col]
+				if !ok || rec.Column(i).IsNull(r) {
+					return ""
+				}
+				return cell(rec.Column(i), r)
+			}
+			for r := 0; r < int(rec.NumRows()); r++ {
+				t := tbl{
+					catalog: get("catalog_name", r), schema: get("db_schema_name", r),
+					name: get("table_name", r), typ: get("table_type", r),
+				}
+				if i, ok := idx["table_schema"]; ok && !rec.Column(i).IsNull(r) {
+					var b []byte
+					switch col := rec.Column(i).(type) {
+					case *array.Binary:
+						b = col.Value(r)
+					case *array.LargeBinary:
+						b = col.Value(r)
+					}
+					if b != nil {
+						if sc, err := flight.DeserializeSchema(b, memory.DefaultAllocator); err == nil {
+							t.arrow = sc
+						}
+					}
+				}
+				tables = append(tables, t)
+			}
+		}
+		err = rdr.Err()
+		rdr.Release()
+		if err != nil {
+			return err
+		}
+	}
+	if len(tables) == 0 {
+		fmt.Println("no tables visible (GetTables returned nothing)")
+		return nil
+	}
+
+	fmt.Println("## tables")
+	fmt.Println()
+	fmt.Println("| catalog | schema | table | type |")
+	fmt.Println("| --- | --- | --- | --- |")
+	for _, t := range tables {
+		fmt.Printf("| %s | %s | %s | %s |\n", t.catalog, t.schema, t.name, t.typ)
+	}
+	for _, t := range tables {
+		if t.arrow == nil {
+			continue
+		}
+		fmt.Printf("\n## %s\n\n", t.name)
+		fmt.Println("| column | type | nullable |")
+		fmt.Println("| --- | --- | --- |")
+		for _, f := range t.arrow.Fields() {
+			null := ""
+			if f.Nullable {
+				null = "yes"
+			}
+			fmt.Printf("| %s | %s | %s |\n", f.Name, f.Type, null)
+		}
+	}
+	fmt.Println("\nnext: `sparrow info <table>` for a row count · `sparrow sql \"SELECT ... LIMIT 20\" -o md` to look at data")
 	return nil
 }
 
@@ -778,8 +956,47 @@ example: sparrow info series_data`)
 	return nil
 }
 
-func cmdProfiles() error {
+func cmdProfiles(args []string) error {
 	cfg := loadConfig()
+	if len(args) > 0 {
+		switch args[0] {
+		case "use":
+			if len(args) < 2 {
+				return fmt.Errorf("usage: sparrow profiles use <name>")
+			}
+			if _, ok := cfg.Profiles[args[1]]; !ok {
+				return fmt.Errorf("unknown profile %q", args[1])
+			}
+			cfg.Default = args[1]
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("default profile: %s\n", args[1])
+			return nil
+		case "rm":
+			if len(args) < 2 {
+				return fmt.Errorf("usage: sparrow profiles rm <name>")
+			}
+			if _, ok := cfg.Profiles[args[1]]; !ok {
+				return fmt.Errorf("unknown profile %q", args[1])
+			}
+			delete(cfg.Profiles, args[1])
+			if cfg.Default == args[1] {
+				cfg.Default = ""
+				for name := range cfg.Profiles {
+					cfg.Default = name
+					break
+				}
+			}
+			if err := saveConfig(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("removed profile %q (default: %s)\n", args[1], cfg.Default)
+			return nil
+		default:
+			return fmt.Errorf("usage: sparrow profiles [use <name> | rm <name>]")
+		}
+	}
 	if len(cfg.Profiles) == 0 {
 		fmt.Println("no profiles — run: sparrow connect <uri>")
 		return nil
@@ -808,16 +1025,19 @@ func usage() {
 
 usage:
   sparrow connect <grpc[+tls]://host:port> [--basic user:pass] [--tls-skip-verify] [--name p]
+  sparrow orient [-s profile]                     one-shot markdown map: vendor, tables, schemas
   sparrow ls [pattern] [-s profile] [-o format]
   sparrow info <table> [-s profile] [--no-count]
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N]
-  sparrow profiles
+  sparrow sql -                                   read SQL from stdin (also: -f query.sql)
+  sparrow profiles [use <name> | rm <name>]
   sparrow version
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
   data.parquet · data.csv · data.json · data.jsonl · data.arrow · data.md
 Defaults: a TTY gets a table; a pipe streams raw Arrow IPC (composable with
-DuckDB, Python, anything). Agents and scripts: use -o md, -o jsonl or -o csv.`)
+DuckDB, Python, anything). Agents and scripts: use -o md, -o jsonl or -o csv.
+Exit codes: 0 ok · 1 query error · 2 connection/auth · 3 usage.`)
 }
 
 func main() {
@@ -833,10 +1053,12 @@ func main() {
 		err = cmdLs(os.Args[2:])
 	case "info":
 		err = cmdInfo(os.Args[2:])
+	case "orient":
+		err = cmdOrient(os.Args[2:])
 	case "sql":
 		err = cmdSQL(os.Args[2:])
 	case "profiles":
-		err = cmdProfiles()
+		err = cmdProfiles(os.Args[2:])
 	case "version":
 		fmt.Println("sparrow", version)
 	case "help", "-h", "--help":
@@ -849,6 +1071,8 @@ func main() {
 				err = cmdLs([]string{"-h"})
 			case "info":
 				err = cmdInfo([]string{"-h"})
+			case "orient":
+				err = cmdOrient([]string{"-h"})
 			case "sql":
 				err = cmdSQL([]string{"-h"})
 			default:
@@ -863,6 +1087,19 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		// connection/auth/profile failures exit 2, query errors exit 1 —
+		// gRPC dials lazily, so Unavailable/Unauthenticated surface at the
+		// first RPC and are classified here rather than at dial time
+		var ce connError
+		if errors.As(err, &ce) {
+			os.Exit(2)
+		}
+		if s, ok := status.FromError(err); ok {
+			switch s.Code() {
+			case codes.Unavailable, codes.Unauthenticated:
+				os.Exit(2)
+			}
+		}
 		os.Exit(1)
 	}
 }

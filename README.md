@@ -25,10 +25,11 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | command | does | wire calls |
 |---|---|---|
 | `sparrow connect <uri>` | verify + save a profile | vendor probe via `GetSqlInfo`, `SELECT 1` fallback |
+| `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
 | `sparrow ls [pattern]` | list tables | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
-| `sparrow sql "<query>"` | run a statement | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
-| `sparrow profiles` | list saved connections | — |
+| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth: `--basic user:pass` (API key as user works; Bearer handoff adopted
 automatically, GizmoSQL-style). TLS: `grpc://` plain, `grpc+tls://` verified,
@@ -56,24 +57,32 @@ sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" \
 ## For AI agents (Claude Code, etc.)
 
 AI agents don't need a Flight client library — they can just call the CLI.
-Three commands orient one completely; `-o md` returns tables it can read
-natively:
+**One command maps any Flight server** — vendor, tables, schemas, as markdown:
 
 ```sh
-sparrow ls -o md                 # what tables exist
-sparrow info series_data         # schema + row count
+sparrow orient
+```
+
+Then query with results the agent reads natively:
+
+```sh
+sparrow info series_data                  # row count for one table
 sparrow sql "SELECT ... LIMIT 20" -o md   # readable results
+echo "SELECT ..." | sparrow sql - -o md   # SQL via stdin — no shell-quoting battles
 ```
 
 Conventions agents can rely on:
 
 - `-o md` / `-o jsonl` / `-o csv` are stable, parseable stdout formats — no
   ANSI, no decoration; row-count and timing summaries go to **stderr**.
-- Exit codes: `0` ok · `1` query/connection error · `3` usage.
-- `--max-rows N` caps emitted rows (the total still reports on stderr).
-  Prefer `LIMIT` in SQL — `--max-rows` still downloads the full result.
-- Profiles live in `~/.sparrow/config.json`; `-s <profile>` selects one,
-  `-s grpc+tls://host:port --basic u:p` works ad-hoc.
+- Exit codes: `0` ok · `1` query error · `2` connection/auth · `3` usage —
+  branch on "server down" vs "my SQL was wrong".
+- `-o md` caps at 1,000 rows by default so a careless `SELECT *` can't flood
+  a context window (the true total reports on stderr; `--max-rows` overrides).
+  Data formats (csv/jsonl/json/arrow/parquet) always emit everything.
+- Prefer `LIMIT` in SQL — `--max-rows` still downloads the full result.
+- Profiles live in `~/.sparrow/config.json`; `sparrow profiles use <name>`
+  switches the default, `-s grpc+tls://host:port --basic u:p` works ad-hoc.
 
 ## Build from source
 
