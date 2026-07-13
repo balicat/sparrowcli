@@ -1,5 +1,7 @@
 # sparrow
 
+[![test](https://github.com/balicat/sparrowcli/actions/workflows/test.yml/badge.svg)](https://github.com/balicat/sparrowcli/actions/workflows/test.yml)
+
 **A terminal client for any Apache Arrow Flight / Flight SQL server.**
 One static binary: browse the catalog, run SQL, stream Arrow onward.
 Human-friendly on a TTY, machine-friendly in a pipe, **agent-friendly by design**.
