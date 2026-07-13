@@ -32,6 +32,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
+| `sparrow ping` | latency percentiles: bare TCP vs warm-channel RPC — the gap is the server | repeated no-match `GetTables` on one channel |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth — the two adapters that cover the whole tested landscape:
@@ -111,6 +112,44 @@ version, ALPN (gRPC needs `h2`; doctor says so when a proxy won't negotiate
 it), certificate issuer and expiry, the auth handshake, the vendor, and a
 timed round trip. `-o json` for scripts; exit `2` if any layer fails.
 
+## Measure — is it the network or the server?
+
+`sparrow ping` runs two round trips per round — a bare TCP connect (pure
+network) and a lightweight RPC on the warm, authenticated channel (network +
+server) — and summarizes the percentiles. The gap between the two is the
+server:
+
+```
+$ sparrow ping -n 5 -s grpc+tls://flight.sparrowflight.io:443 --basic demo:demo
+round  1   tcp    75.9 ms   rpc    86.1 ms
+...
+            min     p50     p95     max
+tcp        61.3    63.4    75.9    75.9  ms
+rpc        75.4    81.4    86.1    86.1  ms   (5/5 ok)
+
+≈ network 63.4 ms + server 18.0 ms (medians)
+```
+
+`sparrow sql --stats` breaks a query's wall clock into its anatomy — plan,
+first byte, stream — plus rows, bytes that actually crossed the wire (counted
+at the gRPC layer), and throughput. A million rows over the public internet:
+
+```
+$ sparrow sql "SELECT * FROM series_data LIMIT 1000000" -o big.parquet --stats
+── query stats ─────────────────────────
+plan (GetFlightInfo)      73 ms
+first byte               834 ms
+stream (DoGet)          6999 ms
+total                   7075 ms
+rows       1,000,000 in 489 batches
+wire       45.1 MB received
+speed      51 Mbit/s over the stream
+```
+
+Stats go to stderr, so they compose with every output format and pipe.
+Every benchmark number this project publishes is reproducible with this flag.
+`ping -o json` for scripts; both work against any Flight SQL server.
+
 ## Install
 
 Download a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
@@ -147,6 +186,9 @@ Conventions agents can rely on:
   branch on "server down" vs "my SQL was wrong".
 - On exit `2`, run `sparrow doctor -o json` — a layer-by-layer diagnosis
   (DNS, TCP, TLS/ALPN, auth) as structured JSON, instead of guessing.
+- `sparrow ping -o json` (latency percentiles, network-vs-server split) and
+  `sql --stats` (timing/throughput anatomy on stderr) make measurements
+  scriptable too.
 - `-o md` caps at 1,000 rows by default so a careless `SELECT *` can't flood
   a context window (the true total reports on stderr; `--max-rows` overrides).
   Data formats (csv/jsonl/json/arrow/parquet) always emit everything.

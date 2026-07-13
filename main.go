@@ -14,11 +14,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
@@ -36,11 +39,12 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.5.0-dev"
+var version = "0.6.0-dev"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -136,7 +140,7 @@ func tlsConfigFor(p Profile) (*tls.Config, error) {
 	return tc, nil
 }
 
-func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, error) {
+func dial(ctx context.Context, p Profile, extra ...grpc.DialOption) (*flightsql.Client, context.Context, error) {
 	target, useTLS, err := parseURI(p.URI)
 	if err != nil {
 		return nil, ctx, connError{err}
@@ -151,7 +155,7 @@ func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, e
 	} else {
 		creds = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
-	cl, err := flightsql.NewClient(target, nil, nil, creds)
+	cl, err := flightsql.NewClient(target, nil, nil, append([]grpc.DialOption{creds}, extra...)...)
 	if err != nil {
 		return nil, ctx, connError{err}
 	}
@@ -530,8 +534,32 @@ func (rw *recordWriter) end() error {
 	return nil
 }
 
-func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, s sink, maxRows int) (int64, error) {
+// qstats collects the anatomy of a query's data phase for sql --stats.
+type qstats struct {
+	gotFirst          bool
+	firstMs, streamMs int64
+	batches           int64
+}
+
+// byteCounter is a grpc stats.Handler that counts payload bytes as they cross
+// the wire — the honest transfer number for sql --stats throughput.
+type byteCounter struct{ in, out atomic.Int64 }
+
+func (b *byteCounter) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context { return ctx }
+func (b *byteCounter) HandleRPC(_ context.Context, s stats.RPCStats) {
+	switch v := s.(type) {
+	case *stats.InPayload:
+		b.in.Add(int64(v.WireLength))
+	case *stats.OutPayload:
+		b.out.Add(int64(v.WireLength))
+	}
+}
+func (b *byteCounter) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
+func (b *byteCounter) HandleConn(context.Context, stats.ConnStats)                       {}
+
+func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, s sink, maxRows int, st *qstats) (int64, error) {
 	rw := &recordWriter{s: s, maxRows: maxRows}
+	tStream := time.Now()
 	for _, ep := range info.Endpoint {
 		rdr, err := cl.DoGet(ctx, ep.Ticket)
 		if err != nil {
@@ -544,6 +572,13 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 			}
 		}
 		for rdr.Next() {
+			if st != nil {
+				if !st.gotFirst {
+					st.gotFirst = true
+					st.firstMs = time.Since(tStream).Milliseconds()
+				}
+				st.batches++
+			}
 			if err := rw.write(rdr.Record()); err != nil {
 				rdr.Release()
 				return rw.total, err
@@ -554,6 +589,9 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 		if err != nil {
 			return rw.total, err
 		}
+	}
+	if st != nil {
+		st.streamMs = time.Since(tStream).Milliseconds()
 	}
 	if err := rw.end(); err != nil {
 		return rw.total, err
@@ -724,7 +762,7 @@ example: sparrow ls -o md`)
 	if err != nil {
 		return err
 	}
-	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000))
+	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000), nil)
 	return err
 }
 
@@ -739,6 +777,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	file := fs.String("f", "", "read the SQL from a file")
 	encKey := fs.String("encrypt-key", "", "encrypt parquet output (Parquet Modular Encryption): hex, env:VAR or file:path")
+	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr: plan / first byte / stream, rows, wire bytes, throughput")
 	pos := parseFlags(fs, args)
 	var query string
 	switch {
@@ -767,7 +806,13 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	cl, ctx, err := dial(ctx, p)
+	var counter *byteCounter
+	var extra []grpc.DialOption
+	if *statsOn {
+		counter = &byteCounter{}
+		extra = append(extra, grpc.WithStatsHandler(counter))
+	}
+	cl, ctx, err := dial(ctx, p, extra...)
 	if err != nil {
 		return err
 	}
@@ -777,6 +822,11 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	info, err := cl.Execute(ctx, query)
 	if err != nil {
 		return err
+	}
+	planMs := time.Since(t0).Milliseconds()
+	var wireAtPlan int64
+	if counter != nil {
+		wireAtPlan = counter.in.Load()
 	}
 	s, err := resolveSink(*output)
 	if err != nil {
@@ -792,14 +842,37 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		}
 		s.encKey = k
 	}
-	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40))
+	var st *qstats
+	if *statsOn {
+		st = &qstats{}
+	}
+	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40), st)
 	if err != nil {
 		return err
 	}
-	if s.path != "" {
+	if *statsOn {
+		wire := counter.in.Load() - wireAtPlan // DoGet payloads only
+		var mbit float64
+		if st.streamMs > 0 {
+			mbit = float64(wire) * 8 / 1e6 / (float64(st.streamMs) / 1000)
+		}
+		fmt.Fprintf(os.Stderr, `── query stats ─────────────────────────
+plan (GetFlightInfo)  %6d ms
+first byte            %6d ms
+stream (DoGet)        %6d ms
+total                 %6d ms
+rows       %s in %d batches
+wire       %.1f MB received
+speed      %.0f Mbit/s over the stream
+`, planMs, st.firstMs, st.streamMs, time.Since(t0).Milliseconds(),
+			groupDigits(fmt.Sprint(total)), st.batches, float64(wire)/1e6, mbit)
+	} else if s.path != "" {
 		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
 	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
+	}
+	if s.path != "" && *statsOn {
+		fmt.Fprintf(os.Stderr, "✓ → %s\n", s.path)
 	}
 	return nil
 }
@@ -1609,6 +1682,140 @@ func countRows(ctx context.Context, cl *flightsql.Client, info *flight.FlightInf
 	return n, nil
 }
 
+// ── ping ────────────────────────────────────────────────────────────────
+
+// percentile: nearest-rank on a sorted slice.
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int(math.Round(q*float64(len(sorted)-1)))]
+}
+
+type pingRound struct {
+	TCPMs float64 `json:"tcp_ms"`
+	RPCMs float64 `json:"rpc_ms"`
+	Err   string  `json:"error,omitempty"`
+}
+
+// cmdPing measures two round trips per round: a bare TCP connect (pure
+// network) and a lightweight RPC on the already-authenticated channel
+// (network + server). The gap between their medians is the server's overhead.
+func cmdPing(args []string) error {
+	fs := newFlagSet("ping", `usage: sparrow ping [flags]
+round-trip latency over N rounds: a bare TCP connect (the network) next to a
+lightweight RPC on a warm channel (network + server). The gap is the server.
+examples: sparrow ping · sparrow ping -n 20 -s gizmo · sparrow ping -o json`)
+	cf := addConnFlags(fs)
+	n := fs.Int("n", 10, "rounds")
+	interval := fs.Duration("interval", 200*time.Millisecond, "pause between rounds")
+	output := fs.String("o", "", `output: "json" for a machine-readable report`)
+	parseFlags(fs, args)
+	asJSON := false
+	switch strings.ToLower(*output) {
+	case "":
+	case "json":
+		asJSON = true
+	default:
+		return fmt.Errorf(`ping -o supports only "json"`)
+	}
+	if *n < 1 {
+		return fmt.Errorf("ping -n wants at least 1")
+	}
+
+	p, pname, err := cf.resolve()
+	if err != nil {
+		return err
+	}
+	target, _, err := parseURI(p.URI)
+	if err != nil {
+		return connError{err}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(*n)*(*interval)+2*time.Minute)
+	defer cancel()
+	cl, ctx, err := dial(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	if !asJSON {
+		fmt.Printf("sparrow ping — %s (profile: %s) · %d rounds\n\n", p.URI, pname, *n)
+	}
+	pat := "__sparrow_ping__" // matches no table; the RPC round trip is the point
+	rounds := make([]pingRound, 0, *n)
+	var tcps, rpcs []float64
+	fails := 0
+	for i := 0; i < *n; i++ {
+		if i > 0 {
+			time.Sleep(*interval)
+		}
+		var r pingRound
+		t := time.Now()
+		c, err := net.DialTimeout("tcp", target, 10*time.Second)
+		if err != nil {
+			r.Err = err.Error()
+		} else {
+			r.TCPMs = float64(time.Since(t).Microseconds()) / 1000
+			c.Close()
+			tcps = append(tcps, r.TCPMs)
+			rpcCtx, rc := context.WithTimeout(ctx, 15*time.Second)
+			t = time.Now()
+			_, err = cl.GetTables(rpcCtx, &flightsql.GetTablesOpts{TableNameFilterPattern: &pat})
+			rc()
+			if err != nil {
+				r.Err = err.Error()
+			} else {
+				r.RPCMs = float64(time.Since(t).Microseconds()) / 1000
+				rpcs = append(rpcs, r.RPCMs)
+			}
+		}
+		if r.Err != "" {
+			fails++
+		}
+		rounds = append(rounds, r)
+		if !asJSON {
+			if r.Err != "" {
+				fmt.Printf("round %2d   FAILED: %s\n", i+1, r.Err)
+			} else {
+				fmt.Printf("round %2d   tcp %7.1f ms   rpc %7.1f ms\n", i+1, r.TCPMs, r.RPCMs)
+			}
+		}
+	}
+	sort.Float64s(tcps)
+	sort.Float64s(rpcs)
+	quarts := func(v []float64) (min, p50, p95, max float64) {
+		if len(v) == 0 {
+			return
+		}
+		return v[0], percentile(v, 0.5), percentile(v, 0.95), v[len(v)-1]
+	}
+	t1, t2, t3, t4 := quarts(tcps)
+	r1, r2, r3, r4 := quarts(rpcs)
+	if asJSON {
+		out := map[string]any{
+			"endpoint": p.URI, "profile": pname, "rounds": rounds, "failures": fails,
+			"tcp_ms": map[string]float64{"min": t1, "p50": t2, "p95": t3, "max": t4},
+			"rpc_ms": map[string]float64{"min": r1, "p50": r2, "p95": r3, "max": r4},
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		fmt.Println()
+		fmt.Printf("        %7s %7s %7s %7s\n", "min", "p50", "p95", "max")
+		fmt.Printf("tcp     %7.1f %7.1f %7.1f %7.1f  ms\n", t1, t2, t3, t4)
+		fmt.Printf("rpc     %7.1f %7.1f %7.1f %7.1f  ms   (%d/%d ok)\n", r1, r2, r3, r4, len(rpcs), *n)
+		if len(tcps) > 0 && len(rpcs) > 0 {
+			fmt.Printf("\n≈ network %.1f ms + server %.1f ms (medians)\n", t2, math.Max(0, r2-t2))
+		}
+	}
+	if len(rpcs) == 0 {
+		return connError{fmt.Errorf("ping: all %d rounds failed", *n)}
+	}
+	return nil
+}
+
 func usage() {
 	fmt.Println(`sparrow ` + version + ` — Arrow Flight data. At the speed of the command line.
 
@@ -1617,9 +1824,10 @@ usage:
   sparrow orient [-s profile]                     one-shot markdown map: vendor, tables, schemas
   sparrow ls [pattern] [-s profile] [-o format]
   sparrow info <table> [-s profile] [--no-count]
-  sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N]
+  sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
+  sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
   sparrow profiles [use <name> | rm <name>]
   sparrow version
 
@@ -1652,6 +1860,8 @@ func main() {
 		err = cmdSQL(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "ping":
+		err = cmdPing(os.Args[2:])
 	case "profiles":
 		err = cmdProfiles(os.Args[2:])
 	case "version":
@@ -1672,6 +1882,8 @@ func main() {
 				err = cmdSQL([]string{"-h"})
 			case "doctor":
 				err = cmdDoctor([]string{"-h"})
+			case "ping":
+				err = cmdPing([]string{"-h"})
 			default:
 				usage()
 			}
