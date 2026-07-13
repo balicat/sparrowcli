@@ -46,7 +46,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.9.0-dev"
+var version = "0.9.1-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -1256,14 +1256,14 @@ total                 %6d ms
 			fmt.Fprintf(os.Stderr, "… %s messages total (first %d shown)\n", groupDigits(fmt.Sprint(total)), shown)
 		}
 	}
-	if *statsOn || *ipcOn {
-		// the reports above replace the one-line summary
+	if *statsOn {
+		// --stats prints its own rows line above
 	} else if s.path != "" {
 		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
 	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
 	}
-	if s.path != "" && (*statsOn || *ipcOn) {
+	if s.path != "" && *statsOn {
 		fmt.Fprintf(os.Stderr, "✓ → %s\n", s.path)
 	}
 	return nil

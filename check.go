@@ -393,7 +393,13 @@ examples: sparrow check series_data --key series_id --time period
 
 	// ── time span + staleness ─────────────────────────────────────────────
 	if timeCol == "" {
-		d.emit(checkResult{Check: "time", Status: "skip", Detail: "pass --time <col> for span + staleness"})
+		st, hint := "skip", ""
+		if maxAge > 0 {
+			st = "warn"
+			hint = "--max-age was given but no time column was found or auto-detected"
+		}
+		d.emit(checkResult{Check: "time", Status: st,
+			Detail: "pass --time <col> for span + staleness", Hint: hint})
 	} else {
 		qt := quoteIdent(timeCol)
 		if row, err := row1("SELECT MIN(" + qt + "), MAX(" + qt + ") FROM " + texpr); err != nil {
@@ -436,24 +442,33 @@ examples: sparrow check series_data --key series_id --time period
 
 	// ── frozen series: entities whose value never changes ─────────────────
 	valueCol := *valueF
-	if valueCol == "" { // default: the sole numeric non-key column
-		var numeric []string
-		for _, f := range schema.Fields() {
-			if !isNumericType(f.Type.ID()) || f.Name == timeCol {
-				continue
-			}
-			isKey := false
-			for _, k := range keys {
-				if f.Name == k {
-					isKey = true
-				}
-			}
-			if !isKey {
-				numeric = append(numeric, f.Name)
+	var numericCands []string
+	for _, f := range schema.Fields() {
+		if !isNumericType(f.Type.ID()) || f.Name == timeCol {
+			continue
+		}
+		isKey := false
+		for _, k := range keys {
+			if f.Name == k {
+				isKey = true
 			}
 		}
-		if len(numeric) == 1 {
-			valueCol = numeric[0]
+		if !isKey {
+			numericCands = append(numericCands, f.Name)
+		}
+	}
+	if valueCol == "" && len(numericCands) == 1 { // sole candidate: auto-pick
+		valueCol = numericCands[0]
+	}
+	if len(keys) > 0 && valueCol == "" {
+		switch len(numericCands) {
+		case 0:
+			d.emit(checkResult{Check: "frozen", Status: "skip",
+				Detail: "no numeric value column — nothing to test for constancy"})
+		default:
+			d.emit(checkResult{Check: "frozen", Status: "skip",
+				Detail: "value column is ambiguous — pass --value (candidates: " +
+					strings.Join(numericCands, ", ") + ")"})
 		}
 	}
 	if len(keys) > 0 && valueCol != "" {
@@ -495,6 +510,9 @@ examples: sparrow check series_data --key series_id --time period
 	}
 	if len(numCols) > 8 {
 		numCols = numCols[:8]
+	}
+	if len(numCols) == 0 {
+		d.emit(checkResult{Check: "numeric", Status: "skip", Detail: "no numeric columns"})
 	}
 	if len(numCols) > 0 {
 		sel := "SELECT"
