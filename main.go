@@ -46,7 +46,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.8.1-dev"
+var version = "0.9.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -657,6 +657,8 @@ func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
 // IPC body-compression codec, not just infer one from the wire/decode ratio.
 type byteCounter struct {
 	in, out atomic.Int64
+	msgs    atomic.Int64 // FlightData messages seen
+	capN    int          // how many headers to keep (0 → 8)
 	mu      sync.Mutex
 	headers [][]byte
 }
@@ -667,8 +669,13 @@ func (b *byteCounter) HandleRPC(_ context.Context, s stats.RPCStats) {
 	case *stats.InPayload:
 		b.in.Add(int64(v.WireLength))
 		if fd, ok := v.Payload.(*flight.FlightData); ok && len(fd.DataHeader) > 0 {
+			b.msgs.Add(1)
 			b.mu.Lock()
-			if len(b.headers) < 8 {
+			max := b.capN
+			if max <= 0 {
+				max = 8
+			}
+			if len(b.headers) < max {
 				b.headers = append(b.headers, append([]byte(nil), fd.DataHeader...))
 			}
 			b.mu.Unlock()
@@ -676,6 +683,12 @@ func (b *byteCounter) HandleRPC(_ context.Context, s stats.RPCStats) {
 	case *stats.OutPayload:
 		b.out.Add(int64(v.WireLength))
 	}
+}
+
+func (b *byteCounter) snapshotHeaders() [][]byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([][]byte(nil), b.headers...)
 }
 
 // declaredCodec walks the captured headers for the first RecordBatch message
@@ -743,38 +756,95 @@ func fbTable(b []byte, fieldOff int) int {
 	return fieldOff + int(uoff)
 }
 
-func ipcCodec(header []byte) (codec string, isRecordBatch bool) {
-	rootOff, ok := fbU32(header, 0)
+func fbI64(b []byte, off int) (int64, bool) {
+	if off < 0 || off+8 > len(b) {
+		return 0, false
+	}
+	var v uint64
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | uint64(b[off+i])
+	}
+	return int64(v), true
+}
+
+// ipcMsg is one Arrow IPC message's manifest, read from its header alone.
+type ipcMsg struct {
+	Typ   string // schema | dictionary | record batch
+	Rows  int64
+	Body  int64  // body bytes that followed this header on the wire
+	Codec string // "" = no BodyCompression table
+	Meta  int    // custom_metadata key-value count
+}
+
+func fbBatchInto(h []byte, rb int, m *ipcMsg) {
+	if lOff := fbField(h, rb, 0); lOff != 0 { // RecordBatch.length
+		m.Rows, _ = fbI64(h, lOff)
+	}
+	if cOff := fbField(h, rb, 3); cOff != 0 { // RecordBatch.compression
+		comp := fbTable(h, cOff)
+		m.Codec = "lz4_frame" // flatbuffers elide the default enum value
+		if codOff := fbField(h, comp, 0); codOff != 0 && codOff < len(h) {
+			switch h[codOff] {
+			case 0:
+				m.Codec = "lz4_frame"
+			case 1:
+				m.Codec = "zstd"
+			default:
+				m.Codec = fmt.Sprintf("codec(%d)", h[codOff])
+			}
+		}
+	}
+}
+
+func ipcHeaderInfo(h []byte) (ipcMsg, bool) {
+	var m ipcMsg
+	rootOff, ok := fbU32(h, 0)
 	if !ok {
-		return "", false
+		return m, false
 	}
 	msg := int(rootOff)
-	// Message.header_type (field 1): MessageHeader union — RecordBatch = 3
-	htOff := fbField(header, msg, 1)
-	if htOff == 0 || htOff >= len(header) || header[htOff] != 3 {
-		return "", false
+	if blOff := fbField(h, msg, 3); blOff != 0 { // Message.bodyLength
+		m.Body, _ = fbI64(h, blOff)
 	}
-	rbOff := fbField(header, msg, 2) // Message.header (field 2)
-	if rbOff == 0 {
-		return "", false
+	if kvOff := fbField(h, msg, 4); kvOff != 0 { // Message.custom_metadata
+		if n, ok := fbU32(h, fbTable(h, kvOff)); ok {
+			m.Meta = int(n)
+		}
 	}
-	rb := fbTable(header, rbOff)
-	compOff := fbField(header, rb, 3) // RecordBatch.compression (field 3)
-	if compOff == 0 {
-		return "", true // record batch, no BodyCompression table
+	htOff := fbField(h, msg, 1) // MessageHeader union type
+	hOff := fbField(h, msg, 2)  // union value
+	if htOff == 0 || htOff >= len(h) || hOff == 0 {
+		return m, false
 	}
-	comp := fbTable(header, compOff)
-	codecOff := fbField(header, comp, 0) // BodyCompression.codec (field 0)
-	if codecOff == 0 || codecOff >= len(header) {
-		return "lz4_frame", true // elided default = LZ4_FRAME
-	}
-	switch header[codecOff] {
-	case 0:
-		return "lz4_frame", true
+	tbl := fbTable(h, hOff)
+	switch h[htOff] {
 	case 1:
-		return "zstd", true
+		m.Typ = "schema"
+	case 2:
+		m.Typ = "dictionary"
+		if idOff := fbField(h, tbl, 0); idOff != 0 { // DictionaryBatch.id
+			if id, ok := fbI64(h, idOff); ok {
+				m.Typ = fmt.Sprintf("dictionary id=%d", id)
+			}
+		}
+		if dOff := fbField(h, tbl, 1); dOff != 0 { // DictionaryBatch.data
+			fbBatchInto(h, fbTable(h, dOff), &m)
+		}
+	case 3:
+		m.Typ = "record batch"
+		fbBatchInto(h, tbl, &m)
+	default:
+		m.Typ = fmt.Sprintf("type(%d)", h[htOff])
 	}
-	return fmt.Sprintf("codec(%d)", header[codecOff]), true
+	return m, true
+}
+
+func ipcCodec(header []byte) (codec string, isRecordBatch bool) {
+	m, ok := ipcHeaderInfo(header)
+	if !ok || m.Typ != "record batch" {
+		return "", false
+	}
+	return m.Codec, true
 }
 func (b *byteCounter) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
 func (b *byteCounter) HandleConn(context.Context, stats.ConnStats)                       {}
@@ -1009,6 +1079,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	file := fs.String("f", "", "read the SQL from a file")
 	encKey := fs.String("encrypt-key", "", "encrypt parquet output (Parquet Modular Encryption): hex, env:VAR or file:path")
 	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr: plan / first byte / stream, rows, wire bytes, throughput")
+	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr: message type, rows, body bytes, codec, custom metadata")
 	pos := parseFlags(fs, args)
 	var query string
 	switch {
@@ -1039,8 +1110,11 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	defer cancel()
 	var counter *byteCounter
 	var extra []grpc.DialOption
-	if *statsOn {
+	if *statsOn || *ipcOn {
 		counter = &byteCounter{}
+		if *ipcOn {
+			counter.capN = 128
+		}
 		extra = append(extra, grpc.WithStatsHandler(counter))
 	}
 	cl, ctx, err := dial(ctx, p, extra...)
@@ -1149,12 +1223,47 @@ total                 %6d ms
 			}
 			tw.Flush()
 		}
+	}
+	if *ipcOn {
+		hdrs := counter.snapshotHeaders()
+		total := counter.msgs.Load()
+		fmt.Fprintln(os.Stderr, "── ipc messages ────────────────────────")
+		tw := tabwriter.NewWriter(os.Stderr, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "#\tmessage\trows\tbody\tcodec\tmeta")
+		shown := 0
+		for i, h := range hdrs {
+			if shown >= 20 {
+				break
+			}
+			m, ok := ipcHeaderInfo(h)
+			if !ok {
+				continue
+			}
+			rows, codec := "—", m.Codec
+			if m.Typ != "schema" {
+				rows = groupDigits(fmt.Sprint(m.Rows))
+				if codec == "" {
+					codec = "none"
+				}
+			} else {
+				codec = "—"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%d\n", i+1, m.Typ, rows, fmtBytes(m.Body), codec, m.Meta)
+			shown++
+		}
+		tw.Flush()
+		if int(total) > shown {
+			fmt.Fprintf(os.Stderr, "… %s messages total (first %d shown)\n", groupDigits(fmt.Sprint(total)), shown)
+		}
+	}
+	if *statsOn || *ipcOn {
+		// the reports above replace the one-line summary
 	} else if s.path != "" {
 		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
 	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
 	}
-	if s.path != "" && *statsOn {
+	if s.path != "" && (*statsOn || *ipcOn) {
 		fmt.Fprintf(os.Stderr, "✓ → %s\n", s.path)
 	}
 	return nil
@@ -1554,10 +1663,10 @@ type doctorReport struct {
 }
 
 type doctor struct {
-	rep              doctorReport
-	json             bool
+	rep               doctorReport
+	json              bool
 	oks, warns, fails int
-	firstFail        string
+	firstFail         string
 }
 
 var statusMark = map[string]string{"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
@@ -2112,11 +2221,12 @@ usage:
   sparrow orient [-s profile]                     one-shot markdown map: vendor, tables, schemas
   sparrow ls [pattern] [-s profile] [-o format]
   sparrow info <table> [-s profile] [--no-count]
-  sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats]
+  sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats] [--ipc]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
+  sparrow feedback "message" [--category bug]     send feedback to the server's maintainer
   sparrow profiles [use <name> | rm <name>]
   sparrow version
 
@@ -2153,6 +2263,8 @@ func main() {
 		err = cmdDoctor(os.Args[2:])
 	case "ping":
 		err = cmdPing(os.Args[2:])
+	case "feedback":
+		err = cmdFeedback(os.Args[2:])
 	case "profiles":
 		err = cmdProfiles(os.Args[2:])
 	case "version":
@@ -2177,6 +2289,8 @@ func main() {
 				err = cmdDoctor([]string{"-h"})
 			case "ping":
 				err = cmdPing([]string{"-h"})
+			case "feedback":
+				err = cmdFeedback([]string{"-h"})
 			case "profiles":
 				fmt.Println("usage: sparrow profiles              list saved connections (* = default)")
 				fmt.Println("       sparrow profiles use <name>   set the default profile")

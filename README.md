@@ -36,6 +36,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers | server-side SQL aggregates — the table is never downloaded |
 | `sparrow ping` | latency percentiles: bare TCP vs warm-channel RPC — the gap is the server | repeated no-match `GetTables` on one channel |
+| `sparrow feedback "msg"` | send feedback to the server's maintainer | the `feedback` DoAction — the public endpoint accepts it |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth — the two adapters that cover the whole tested landscape:
@@ -244,6 +245,12 @@ Conventions agents can rely on:
   scriptable too.
 - `sparrow check <table> --key id -o json` screens a dataset's health without
   downloading it — exit `1` means findings, so it gates pipelines.
+- `sql --ipc` reveals the stream's raw IPC manifest — every message's type
+  (schema / dictionary / record batch), rows, body bytes, declared codec and
+  custom-metadata count — wire-level introspection without a packet capture.
+- **Found a bug or have an idea? `sparrow feedback "..." --from your-name`**
+  delivers it to the server's maintainer over Flight itself (a `feedback`
+  DoAction). Agents are explicitly welcome to use it.
 - `-o md` **to stdout** caps at 1,000 rows by default so a careless `SELECT *`
   can't flood a context window (the true total reports on stderr; `--max-rows`
   overrides). File sinks and data formats (csv/jsonl/json/arrow/parquet)

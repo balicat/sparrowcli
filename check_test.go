@@ -219,3 +219,26 @@ func TestIpcCodec(t *testing.T) {
 		ipcCodec(junk)
 	}
 }
+
+func TestIpcHeaderInfo(t *testing.T) {
+	rec := testRecord(t)
+	defer rec.Release()
+	buf := &bytes.Buffer{}
+	w := ipc.NewWriter(buf, ipc.WithSchema(rec.Schema()), ipc.WithLZ4())
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	msgs := ipcMessages(t, buf.Bytes())
+	if len(msgs) < 2 {
+		t.Fatalf("messages: %d", len(msgs))
+	}
+	m0, ok := ipcHeaderInfo(msgs[0])
+	if !ok || m0.Typ != "schema" {
+		t.Errorf("first message: %+v ok=%v", m0, ok)
+	}
+	m1, ok := ipcHeaderInfo(msgs[1])
+	if !ok || m1.Typ != "record batch" || m1.Rows != 3 || m1.Codec != "lz4_frame" || m1.Body <= 0 {
+		t.Errorf("batch message: %+v ok=%v", m1, ok)
+	}
+}

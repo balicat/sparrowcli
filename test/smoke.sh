@@ -69,6 +69,10 @@ has stats-anatomy "encoding" "$ERR"
 has stats-pacing "pacing" "$ERR"
 has stats-codec "no body compression declared" "$ERR"
 
+t sql-ipc 0 "$BIN" sql "SELECT r FROM range(5000) t(r)" -o csv --ipc
+has ipc-manifest "record batch" "$ERR"
+t feedback-unsupported 1 "$BIN" feedback "smoke test message"
+
 # ── the md cap: stdout capped at 1000, explicit file sink gets everything ─
 t md-cap 0 "$BIN" sql "SELECT r FROM range(1500) t(r)" -o md
 [ "$(grep -c '^|' "$OUT")" = 1002 ] || { echo "FAIL md-cap: $(grep -c '^|' "$OUT") lines"; fails=$((fails + 1)); }
