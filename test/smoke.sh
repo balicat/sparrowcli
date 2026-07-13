@@ -67,6 +67,7 @@ has stats-block "query stats" "$ERR"
 has stats-batches "rows/batch" "$ERR"
 has stats-anatomy "encoding" "$ERR"
 has stats-pacing "pacing" "$ERR"
+has stats-codec "no body compression declared" "$ERR"
 
 # ── the md cap: stdout capped at 1000, explicit file sink gets everything ─
 t md-cap 0 "$BIN" sql "SELECT r FROM range(1500) t(r)" -o md

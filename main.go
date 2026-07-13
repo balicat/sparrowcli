@@ -22,6 +22,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
@@ -45,7 +46,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.8.0-dev"
+var version = "0.8.1-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -651,17 +652,129 @@ func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
 }
 
 // byteCounter is a grpc stats.Handler that counts payload bytes as they cross
-// the wire — the honest transfer number for sql --stats throughput.
-type byteCounter struct{ in, out atomic.Int64 }
+// the wire — the honest transfer number for sql --stats throughput. It also
+// keeps the first few FlightData headers so --stats can report the DECLARED
+// IPC body-compression codec, not just infer one from the wire/decode ratio.
+type byteCounter struct {
+	in, out atomic.Int64
+	mu      sync.Mutex
+	headers [][]byte
+}
 
 func (b *byteCounter) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context { return ctx }
 func (b *byteCounter) HandleRPC(_ context.Context, s stats.RPCStats) {
 	switch v := s.(type) {
 	case *stats.InPayload:
 		b.in.Add(int64(v.WireLength))
+		if fd, ok := v.Payload.(*flight.FlightData); ok && len(fd.DataHeader) > 0 {
+			b.mu.Lock()
+			if len(b.headers) < 8 {
+				b.headers = append(b.headers, append([]byte(nil), fd.DataHeader...))
+			}
+			b.mu.Unlock()
+		}
 	case *stats.OutPayload:
 		b.out.Add(int64(v.WireLength))
 	}
+}
+
+// declaredCodec walks the captured headers for the first RecordBatch message
+// and returns its declared body-compression codec ("lz4_frame", "zstd"), or
+// "" when no BodyCompression table is present (an uncompressed stream).
+func (b *byteCounter) declaredCodec() (codec string, sawBatch bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, h := range b.headers {
+		if c, isBatch := ipcCodec(h); isBatch {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// ── minimal flatbuffer walk over the Arrow IPC Message header ───────────
+//
+// arrow-go's generated flatbuffer code is internal, and the ipc reader
+// decompresses transparently without exposing the codec — so we read the
+// three fields we need straight from the (frozen, spec'd) binary format:
+// Message.header_type (field 1), Message.header (field 2) → RecordBatch.
+// compression (field 3) → BodyCompression.codec (field 0; the enum default
+// 0 = LZ4_FRAME is elided by flatbuffers, so table-present + field-absent
+// still means lz4).
+
+func fbU16(b []byte, off int) (uint16, bool) {
+	if off < 0 || off+2 > len(b) {
+		return 0, false
+	}
+	return uint16(b[off]) | uint16(b[off+1])<<8, true
+}
+
+func fbU32(b []byte, off int) (uint32, bool) {
+	if off < 0 || off+4 > len(b) {
+		return 0, false
+	}
+	return uint32(b[off]) | uint32(b[off+1])<<8 | uint32(b[off+2])<<16 | uint32(b[off+3])<<24, true
+}
+
+// fbField resolves table field i to its data offset (0 = field absent).
+func fbField(b []byte, table int, i int) int {
+	soff, ok := fbU32(b, table) // int32 soffset to vtable
+	if !ok {
+		return 0
+	}
+	vt := table - int(int32(soff))
+	vsize, ok := fbU16(b, vt)
+	if !ok || 4+2*i+2 > int(vsize) {
+		return 0
+	}
+	fo, ok := fbU16(b, vt+4+2*i)
+	if !ok || fo == 0 {
+		return 0
+	}
+	return table + int(fo)
+}
+
+// fbTable follows an offset field to the sub-table it points at.
+func fbTable(b []byte, fieldOff int) int {
+	uoff, ok := fbU32(b, fieldOff)
+	if !ok {
+		return 0
+	}
+	return fieldOff + int(uoff)
+}
+
+func ipcCodec(header []byte) (codec string, isRecordBatch bool) {
+	rootOff, ok := fbU32(header, 0)
+	if !ok {
+		return "", false
+	}
+	msg := int(rootOff)
+	// Message.header_type (field 1): MessageHeader union — RecordBatch = 3
+	htOff := fbField(header, msg, 1)
+	if htOff == 0 || htOff >= len(header) || header[htOff] != 3 {
+		return "", false
+	}
+	rbOff := fbField(header, msg, 2) // Message.header (field 2)
+	if rbOff == 0 {
+		return "", false
+	}
+	rb := fbTable(header, rbOff)
+	compOff := fbField(header, rb, 3) // RecordBatch.compression (field 3)
+	if compOff == 0 {
+		return "", true // record batch, no BodyCompression table
+	}
+	comp := fbTable(header, compOff)
+	codecOff := fbField(header, comp, 0) // BodyCompression.codec (field 0)
+	if codecOff == 0 || codecOff >= len(header) {
+		return "lz4_frame", true // elided default = LZ4_FRAME
+	}
+	switch header[codecOff] {
+	case 0:
+		return "lz4_frame", true
+	case 1:
+		return "zstd", true
+	}
+	return fmt.Sprintf("codec(%d)", header[codecOff]), true
 }
 func (b *byteCounter) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
 func (b *byteCounter) HandleConn(context.Context, stats.ConnStats)                       {}
@@ -994,10 +1107,14 @@ total                 %6d ms
 
 		wireLine := fmt.Sprintf("wire       %s received", fmtBytes(wire))
 		if st.decoded > 0 && wire > 0 {
-			ratio := float64(st.decoded) / float64(wire)
-			wireLine += fmt.Sprintf(" · decodes to %s (%.1f×)", fmtBytes(st.decoded), ratio)
-			if ratio < 1.15 {
-				wireLine += " — stream looks uncompressed"
+			wireLine += fmt.Sprintf(" · decodes to %s (%.1f×)", fmtBytes(st.decoded),
+				float64(st.decoded)/float64(wire))
+		}
+		if codec, saw := counter.declaredCodec(); saw {
+			if codec == "" {
+				wireLine += " · no body compression declared"
+			} else {
+				wireLine += " · codec " + codec
 			}
 		}
 		fmt.Fprintln(os.Stderr, wireLine)

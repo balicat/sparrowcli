@@ -146,7 +146,7 @@ first byte               404 ms
 stream (DoGet)          2304 ms
 total                   2384 ms
 rows       500,000 in 245 batches · rows/batch p50 2,048 (min 288 · max 2,048)
-wire       22.5 MB received · decodes to 22.4 MB (1.0×) — stream looks uncompressed
+wire       22.5 MB received · decodes to 22.4 MB (1.0×) · no body compression declared
 speed      78 Mbit/s over the stream
 pacing     gaps p50 4.2 ms · p95 22.7 ms · max 164.7 ms — 82% of the stream is
            waiting (paced upstream: sender or network stalls between batches)
@@ -158,7 +158,9 @@ value      float64  plain     0      4.0 MB (18%)
 
 That's the stream's full anatomy: the server's batch signature (2,048-row
 chunks — DuckDB's vector size showing through), whether the wire is actually
-compressed (here: no — the decode ratio would expose lz4 instantly), what
+compressed — read from the IPC message header's declared codec, so a
+compressed stream prints `codec lz4_frame` (or `zstd`) with the ratio
+corroborating it — what
 every column arrives *as* (type, arrow-level encoding, nulls, share of the
 bytes), and whether the stream is paced by the wire or by gaps upstream —
 measured excluding the client's own write time, so a slow local sink doesn't
