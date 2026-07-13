@@ -154,9 +154,11 @@ Every benchmark number this project publishes is reproducible with this flag.
 
 Download a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
 (Linux, macOS and Windows; amd64 + arm64), unpack it and put `sparrow` on your
-PATH. Checksums included. Or build from source:
+PATH. Checksums included. Or install with Go, or build from source:
 
 ```sh
+go install github.com/balicat/sparrowcli@latest   # installs as `sparrowcli` — rename if you like
+
 go build -o sparrow .        # Go ≥ 1.25; pure Go, no cgo — trivially cross-compiles
 GOOS=windows go build -o sparrow.exe .
 ```
@@ -189,9 +191,10 @@ Conventions agents can rely on:
 - `sparrow ping -o json` (latency percentiles, network-vs-server split) and
   `sql --stats` (timing/throughput anatomy on stderr) make measurements
   scriptable too.
-- `-o md` caps at 1,000 rows by default so a careless `SELECT *` can't flood
-  a context window (the true total reports on stderr; `--max-rows` overrides).
-  Data formats (csv/jsonl/json/arrow/parquet) always emit everything.
+- `-o md` **to stdout** caps at 1,000 rows by default so a careless `SELECT *`
+  can't flood a context window (the true total reports on stderr; `--max-rows`
+  overrides). File sinks and data formats (csv/jsonl/json/arrow/parquet)
+  always emit everything.
 - Prefer `LIMIT` in SQL — `--max-rows` still downloads the full result.
 - Profiles live in `~/.sparrow/config.json`; `sparrow profiles use <name>`
   switches the default, `-s grpc+tls://host:port --basic u:p` works ad-hoc.

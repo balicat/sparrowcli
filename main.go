@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -44,7 +45,19 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.6.0-dev"
+var version = "0.6.1-dev"
+
+// versionString falls back to the Go module version for `go install` builds,
+// which don't get the ldflags stamp.
+func versionString() string {
+	if !strings.HasSuffix(version, "-dev") {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return strings.TrimPrefix(bi.Main.Version, "v")
+	}
+	return version
+}
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -99,6 +112,15 @@ type connError struct{ err error }
 
 func (e connError) Error() string { return e.err.Error() }
 func (e connError) Unwrap() error { return e.err }
+
+// usageError marks bad invocations so main can exit 3 — a typo'd flag must
+// not read as "server down" (2) or "bad SQL" (1) to a script.
+type usageError struct{ err error }
+
+func (e usageError) Error() string { return e.err.Error() }
+func (e usageError) Unwrap() error { return e.err }
+
+func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format, a...)} }
 
 func parseURI(uri string) (target string, useTLS bool, err error) {
 	switch {
@@ -363,7 +385,7 @@ func resolveSink(o string) (sink, error) {
 	case "md":
 		format = "md"
 	default:
-		return sink{}, fmt.Errorf("-o: unknown format or extension %q (formats: table csv json jsonl md arrow · files: .arrow .parquet .csv .json .jsonl .md)", o)
+		return sink{}, usagef("-o: unknown format or extension %q (formats: table csv json jsonl md arrow · files: .arrow .parquet .csv .json .jsonl .md)", o)
 	}
 	f, err := os.Create(o)
 	if err != nil {
@@ -612,9 +634,12 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 // height, md so an agent's careless SELECT * can't flood its own context.
 // Data formats (csv/json/jsonl/arrow/parquet) emit everything unless
 // --max-rows is given explicitly; the true total always reports on stderr.
-func autoMaxRows(flagVal int, format string, tableDefault int) int {
+func autoMaxRows(flagVal int, format string, tableDefault int, toFile bool) int {
 	if flagVal >= 0 {
 		return flagVal
+	}
+	if toFile { // an explicit file sink gets everything
+		return 0
 	}
 	switch format {
 	case "table":
@@ -628,9 +653,11 @@ func autoMaxRows(flagVal int, format string, tableDefault int) int {
 // ── commands ────────────────────────────────────────────────────────────
 
 // newFlagSet builds a FlagSet whose -h/--help shows the command's own usage
-// line and example, not just bare flag defaults.
+// line and example, not just bare flag defaults. ContinueOnError so parse
+// failures exit 3 (usage), not the flag package's exit 2 — which would read
+// as "connection failed" to anything scripting our exit codes.
 func newFlagSet(name, usage string) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, usage)
 		fmt.Fprintln(os.Stderr, "flags:")
@@ -644,7 +671,12 @@ func newFlagSet(name, usage string) *flag.FlagSet {
 func parseFlags(fs *flag.FlagSet, args []string) []string {
 	var pos []string
 	for {
-		fs.Parse(args)
+		if err := fs.Parse(args); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				os.Exit(0)
+			}
+			os.Exit(3) // the flag package already printed error + usage
+		}
 		rest := fs.Args()
 		if len(rest) == 0 {
 			break
@@ -670,7 +702,7 @@ example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:dem
 	name := fs.String("name", "default", "profile name")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass | --bearer TOKEN] [--header k=v] [--tls-cert/--tls-key/--tls-ca …] [--name profile]")
+		return usagef("usage: sparrow connect <grpc[+tls]://host:port> [--basic user:pass | --bearer TOKEN] [--header k=v] [--tls-cert/--tls-key/--tls-ca …] [--name profile]")
 	}
 	p := Profile{URI: pos[0], Auth: "none", TLSSkipVerify: *tlsSkip,
 		TLSCert: *cert, TLSKey: *key, TLSCA: *ca}
@@ -762,7 +794,7 @@ example: sparrow ls -o md`)
 	if err != nil {
 		return err
 	}
-	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000), nil)
+	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000, s.path != ""), nil)
 	return err
 }
 
@@ -797,7 +829,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	case len(pos) >= 1:
 		query = strings.Join(pos, " ")
 	default:
-		return fmt.Errorf(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
+		return usagef(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
 	p, _, err := cf.resolve()
@@ -846,7 +878,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	if *statsOn {
 		st = &qstats{}
 	}
-	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40), st)
+	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40, s.path != ""), st)
 	if err != nil {
 		return err
 	}
@@ -1061,7 +1093,7 @@ example: sparrow info series_data`)
 	noCount := fs.Bool("no-count", false, "skip the COUNT(*) row estimate")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return fmt.Errorf("usage: sparrow info <table> [-s profile] [--no-count]")
+		return usagef("usage: sparrow info <table> [-s profile] [--no-count]")
 	}
 	table := pos[0]
 
@@ -1188,7 +1220,7 @@ func cmdProfiles(args []string) error {
 		switch args[0] {
 		case "use":
 			if len(args) < 2 {
-				return fmt.Errorf("usage: sparrow profiles use <name>")
+				return usagef("usage: sparrow profiles use <name>")
 			}
 			if _, ok := cfg.Profiles[args[1]]; !ok {
 				return fmt.Errorf("unknown profile %q", args[1])
@@ -1201,7 +1233,7 @@ func cmdProfiles(args []string) error {
 			return nil
 		case "rm":
 			if len(args) < 2 {
-				return fmt.Errorf("usage: sparrow profiles rm <name>")
+				return usagef("usage: sparrow profiles rm <name>")
 			}
 			if _, ok := cfg.Profiles[args[1]]; !ok {
 				return fmt.Errorf("unknown profile %q", args[1])
@@ -1220,7 +1252,7 @@ func cmdProfiles(args []string) error {
 			fmt.Printf("removed profile %q (default: %s)\n", args[1], cfg.Default)
 			return nil
 		default:
-			return fmt.Errorf("usage: sparrow profiles [use <name> | rm <name>]")
+			return usagef("usage: sparrow profiles [use <name> | rm <name>]")
 		}
 	}
 	if len(cfg.Profiles) == 0 {
@@ -1397,7 +1429,7 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 	case "json":
 		d.json = true
 	default:
-		return fmt.Errorf(`doctor -o supports only "json"`)
+		return usagef(`doctor -o supports only "json"`)
 	}
 
 	t0 := time.Now()
@@ -1462,7 +1494,7 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 	default:
 		cfgDetail += " · TLS system roots"
 	}
-	if p.TLSCert != "" {
+	if p.TLSCert != "" && useTLS {
 		cfgDetail += " + mTLS client cert"
 	}
 	cfgStatus, cfgHint := "ok", ""
@@ -1474,9 +1506,13 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 	}
 	d.emit(checkResult{Check: "config", Status: cfgStatus, Detail: cfgDetail, Hint: cfgHint})
 
+	probeTarget := target
 	host, _, err := net.SplitHostPort(target)
-	if err != nil {
+	if err != nil { // no port in the URI — gRPC assumes 443, so probe 443 too
 		host = target
+		probeTarget = net.JoinHostPort(target, "443")
+		d.emit(checkResult{Check: "config", Status: "warn",
+			Detail: "URI has no port — assuming 443 (gRPC's default); prefer an explicit :port"})
 	}
 
 	// 2 · dns
@@ -1504,7 +1540,7 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 
 	// 3 · tcp
 	td := time.Now()
-	rawConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	rawConn, err := net.DialTimeout("tcp", probeTarget, 10*time.Second)
 	if err != nil {
 		d.emit(checkResult{Check: "tcp", Status: "fail", Detail: err.Error(),
 			Hint: "nothing accepted the connection — wrong port, service down, or a firewall dropping it"})
@@ -1533,13 +1569,13 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 		tc.NextProtos = []string{"h2"}
 		dialer := &net.Dialer{Timeout: 10 * time.Second}
 		td = time.Now()
-		conn, err := tls.DialWithDialer(dialer, "tcp", target, tc)
+		conn, err := tls.DialWithDialer(dialer, "tcp", probeTarget, tc)
 		if err != nil {
 			r := checkResult{Check: "tls", Status: "fail", Detail: err.Error(),
 				Hint: connHint(err)}
 			insecureTC := tc.Clone()
 			insecureTC.InsecureSkipVerify = true
-			if c2, err2 := tls.DialWithDialer(dialer, "tcp", target, insecureTC); err2 == nil {
+			if c2, err2 := tls.DialWithDialer(dialer, "tcp", probeTarget, insecureTC); err2 == nil {
 				cs := c2.ConnectionState()
 				c2.Close()
 				for i, cert := range cs.PeerCertificates {
@@ -1717,10 +1753,10 @@ examples: sparrow ping · sparrow ping -n 20 -s gizmo · sparrow ping -o json`)
 	case "json":
 		asJSON = true
 	default:
-		return fmt.Errorf(`ping -o supports only "json"`)
+		return usagef(`ping -o supports only "json"`)
 	}
 	if *n < 1 {
-		return fmt.Errorf("ping -n wants at least 1")
+		return usagef("ping -n wants at least 1")
 	}
 
 	p, pname, err := cf.resolve()
@@ -1817,7 +1853,7 @@ examples: sparrow ping · sparrow ping -n 20 -s gizmo · sparrow ping -o json`)
 }
 
 func usage() {
-	fmt.Println(`sparrow ` + version + ` — Arrow Flight data. At the speed of the command line.
+	fmt.Println(`sparrow ` + versionString() + ` — Arrow Flight data. At the speed of the command line.
 
 usage:
   sparrow connect <grpc[+tls]://host:port> [--basic user:pass] [--tls-skip-verify] [--name p]
@@ -1865,7 +1901,7 @@ func main() {
 	case "profiles":
 		err = cmdProfiles(os.Args[2:])
 	case "version":
-		fmt.Println("sparrow", version)
+		fmt.Println("sparrow", versionString())
 	case "help", "-h", "--help":
 		// "sparrow help <command>" → that command's own -h
 		if len(os.Args) > 2 {
@@ -1884,6 +1920,10 @@ func main() {
 				err = cmdDoctor([]string{"-h"})
 			case "ping":
 				err = cmdPing([]string{"-h"})
+			case "profiles":
+				fmt.Println("usage: sparrow profiles              list saved connections (* = default)")
+				fmt.Println("       sparrow profiles use <name>   set the default profile")
+				fmt.Println("       sparrow profiles rm <name>    remove a profile")
 			default:
 				usage()
 			}
@@ -1899,6 +1939,10 @@ func main() {
 		// connection/auth/profile failures exit 2, query errors exit 1 —
 		// gRPC dials lazily, so Unavailable/Unauthenticated surface at the
 		// first RPC and are classified here rather than at dial time
+		var ue usageError
+		if errors.As(err, &ue) {
+			os.Exit(3)
+		}
 		var ce connError
 		if errors.As(err, &ce) {
 			os.Exit(2)
