@@ -62,8 +62,11 @@ t sql-jsonl 0 "$BIN" sql "SELECT id FROM smoke LIMIT 4" -o jsonl
 [ "$(wc -l <"$OUT")" = 4 ] || { echo "FAIL jsonl-lines"; fails=$((fails + 1)); }
 t sql-stdin 0 bash -c "echo 'SELECT 7 AS seven' | $BIN sql - -o csv"
 has stdin-result "^7$"
-t sql-stats 0 "$BIN" sql "SELECT COUNT(*) FROM smoke" -o csv --stats
+t sql-stats 0 "$BIN" sql "SELECT r FROM range(5000) t(r)" -o csv --stats
 has stats-block "query stats" "$ERR"
+has stats-batches "rows/batch" "$ERR"
+has stats-anatomy "encoding" "$ERR"
+has stats-pacing "pacing" "$ERR"
 
 # ── the md cap: stdout capped at 1000, explicit file sink gets everything ─
 t md-cap 0 "$BIN" sql "SELECT r FROM range(1500) t(r)" -o md

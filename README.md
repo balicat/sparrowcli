@@ -135,19 +135,35 @@ rpc        75.4    81.4    86.1    86.1  ms   (5/5 ok)
 
 `sparrow sql --stats` breaks a query's wall clock into its anatomy — plan,
 first byte, stream — plus rows, bytes that actually crossed the wire (counted
-at the gRPC layer), and throughput. A million rows over the public internet:
+at the gRPC layer), throughput, pacing, and the per-column type/encoding
+breakdown. Half a million rows over the public internet:
 
 ```
-$ sparrow sql "SELECT * FROM series_data LIMIT 1000000" -o big.parquet --stats
+$ sparrow sql "SELECT * FROM series_data LIMIT 500000" --stats > /dev/null
 ── query stats ─────────────────────────
-plan (GetFlightInfo)      73 ms
-first byte               834 ms
-stream (DoGet)          6999 ms
-total                   7075 ms
-rows       1,000,000 in 489 batches
-wire       45.1 MB received
-speed      51 Mbit/s over the stream
+plan (GetFlightInfo)      79 ms
+first byte               404 ms
+stream (DoGet)          2304 ms
+total                   2384 ms
+rows       500,000 in 245 batches · rows/batch p50 2,048 (min 288 · max 2,048)
+wire       22.5 MB received · decodes to 22.4 MB (1.0×) — stream looks uncompressed
+speed      78 Mbit/s over the stream
+pacing     gaps p50 4.2 ms · p95 22.7 ms · max 164.7 ms — 82% of the stream is
+           waiting (paced upstream: sender or network stalls between batches)
+column     type     encoding  nulls  decoded
+series_id  utf8     plain     0      13.2 MB (59%)
+period     utf8     plain     0      5.2 MB (23%)
+value      float64  plain     0      4.0 MB (18%)
 ```
+
+That's the stream's full anatomy: the server's batch signature (2,048-row
+chunks — DuckDB's vector size showing through), whether the wire is actually
+compressed (here: no — the decode ratio would expose lz4 instantly), what
+every column arrives *as* (type, arrow-level encoding, nulls, share of the
+bytes), and whether the stream is paced by the wire or by gaps upstream —
+measured excluding the client's own write time, so a slow local sink doesn't
+skew the verdict. Run the same pull against two servers and the differences
+name themselves.
 
 Stats go to stderr, so they compose with every output format and pipe.
 Every benchmark number this project publishes is reproducible with this flag.

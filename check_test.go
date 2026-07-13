@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
 func TestQuoteIdent(t *testing.T) {
@@ -101,5 +102,50 @@ func TestTrimFloat(t *testing.T) {
 	}
 	if got := trimFloat("not-a-number"); got != "not-a-number" {
 		t.Errorf("passthrough: %q", got)
+	}
+}
+
+func TestArrayDataSize(t *testing.T) {
+	rec := testRecord(t)
+	defer rec.Release()
+	var n int64
+	for _, c := range rec.Columns() {
+		n += arrayDataSize(c.Data())
+	}
+	if n <= 0 {
+		t.Fatalf("no bytes counted: %d", n)
+	}
+	if arrayDataSize(nil) != 0 {
+		t.Error("nil interface not guarded")
+	}
+}
+
+func TestEncodingOf(t *testing.T) {
+	cases := map[string]string{
+		"utf8":                                   "plain",
+		"float64":                                "plain",
+		"dictionary<values=utf8, indices=int32>": "dict",
+		"run_end_encoded<run_ends: int32, values: utf8>": "ree",
+	}
+	for typ, want := range cases {
+		if got := encodingOf(typ); got != want {
+			t.Errorf("encodingOf(%q) = %q, want %q", typ, got, want)
+		}
+	}
+}
+
+func TestFmtBytes(t *testing.T) {
+	if got := fmtBytes(22_500_000); got != "22.5 MB" {
+		t.Errorf("MB: %q", got)
+	}
+	if got := fmtBytes(4_200); got != "4 KB" {
+		t.Errorf("KB: %q", got)
+	}
+}
+
+func TestArrayDataSizeTypedNil(t *testing.T) {
+	var d *array.Data
+	if arrayDataSize(d) != 0 { // typed nil inside the interface — the crash case
+		t.Error("typed-nil *array.Data not guarded")
 	}
 }

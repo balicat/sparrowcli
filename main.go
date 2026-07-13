@@ -45,7 +45,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.7.0-dev"
+var version = "0.8.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -556,11 +556,98 @@ func (rw *recordWriter) end() error {
 	return nil
 }
 
-// qstats collects the anatomy of a query's data phase for sql --stats.
+// qstats collects the anatomy of a query's data phase for sql --stats:
+// timings, per-batch arrivals (pacing), and the per-column type/encoding/
+// size breakdown of what the stream actually carried.
 type qstats struct {
 	gotFirst          bool
 	firstMs, streamMs int64
 	batches           int64
+	rowsPerBatch      []float64
+	waits             []float64 // ms idle between a batch's write end and the next arrival
+	waitTotal         float64
+	lastDone          time.Time
+	colNames          []string
+	colTypes          []string
+	colBytes          []int64
+	colNulls          []int64
+	decoded           int64 // in-memory bytes after IPC decode (vs wire bytes)
+}
+
+// arrayDataSize sums an array's buffer bytes, children and dictionary
+// included — the decoded in-memory footprint of what came off the wire.
+func arrayDataSize(d arrow.ArrayData) int64 {
+	if d == nil {
+		return 0
+	}
+	// Dictionary()/Children() hand back typed-nil *array.Data for plain
+	// columns — a non-nil interface wrapping nil that panics on first use
+	if cd, ok := d.(*array.Data); ok && cd == nil {
+		return 0
+	}
+	var n int64
+	for _, b := range d.Buffers() {
+		if b != nil {
+			n += int64(b.Len())
+		}
+	}
+	for _, c := range d.Children() {
+		n += arrayDataSize(c)
+	}
+	if dd, ok := d.(interface{ Dictionary() arrow.ArrayData }); ok {
+		if dict := dd.Dictionary(); dict != nil {
+			n += arrayDataSize(dict)
+		}
+	}
+	return n
+}
+
+// encodingOf names the arrow-level encoding a column arrives with.
+func encodingOf(typeStr string) string {
+	switch {
+	case strings.HasPrefix(typeStr, "dictionary"):
+		return "dict"
+	case strings.HasPrefix(typeStr, "run_end_encoded"):
+		return "ree"
+	}
+	return "plain"
+}
+
+func fmtBytes(n int64) string {
+	if n >= 1e6 {
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	}
+	return fmt.Sprintf("%.0f KB", float64(n)/1e3)
+}
+
+func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
+	now := time.Now()
+	if !st.gotFirst {
+		st.gotFirst = true
+		st.firstMs = now.Sub(tStream).Milliseconds()
+	} else if !st.lastDone.IsZero() {
+		w := float64(now.Sub(st.lastDone).Microseconds()) / 1000
+		st.waits = append(st.waits, w)
+		st.waitTotal += w
+	}
+	st.batches++
+	st.rowsPerBatch = append(st.rowsPerBatch, float64(rec.NumRows()))
+	if st.colNames == nil {
+		for _, f := range rec.Schema().Fields() {
+			st.colNames = append(st.colNames, f.Name)
+			st.colTypes = append(st.colTypes, f.Type.String())
+		}
+		st.colBytes = make([]int64, len(st.colNames))
+		st.colNulls = make([]int64, len(st.colNames))
+	}
+	for i, col := range rec.Columns() {
+		if i < len(st.colBytes) {
+			b := arrayDataSize(col.Data())
+			st.colBytes[i] += b
+			st.decoded += b
+			st.colNulls[i] += int64(col.NullN())
+		}
+	}
 }
 
 // byteCounter is a grpc stats.Handler that counts payload bytes as they cross
@@ -595,15 +682,14 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 		}
 		for rdr.Next() {
 			if st != nil {
-				if !st.gotFirst {
-					st.gotFirst = true
-					st.firstMs = time.Since(tStream).Milliseconds()
-				}
-				st.batches++
+				st.observe(rdr.Record(), tStream)
 			}
 			if err := rw.write(rdr.Record()); err != nil {
 				rdr.Release()
 				return rw.total, err
+			}
+			if st != nil {
+				st.lastDone = time.Now() // waits exclude our own sink-write time
 			}
 		}
 		err = rdr.Err()
@@ -625,7 +711,7 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 		}
 	}
 	if rw.maxRows > 0 && rw.total > rw.written {
-		fmt.Fprintf(os.Stderr, "… %d rows total (showing %d; use -o or a LIMIT to change)\n", rw.total, rw.written)
+		fmt.Fprintf(os.Stderr, "… %d rows total (showing %d — raise --max-rows or add a LIMIT)\n", rw.total, rw.written)
 	}
 	return rw.total, nil
 }
@@ -893,11 +979,59 @@ plan (GetFlightInfo)  %6d ms
 first byte            %6d ms
 stream (DoGet)        %6d ms
 total                 %6d ms
-rows       %s in %d batches
-wire       %.1f MB received
-speed      %.0f Mbit/s over the stream
-`, planMs, st.firstMs, st.streamMs, time.Since(t0).Milliseconds(),
-			groupDigits(fmt.Sprint(total)), st.batches, float64(wire)/1e6, mbit)
+`, planMs, st.firstMs, st.streamMs, time.Since(t0).Milliseconds())
+
+		rowsLine := fmt.Sprintf("rows       %s in %d batches", groupDigits(fmt.Sprint(total)), st.batches)
+		if len(st.rowsPerBatch) > 1 {
+			rp := append([]float64(nil), st.rowsPerBatch...)
+			sort.Float64s(rp)
+			rowsLine += fmt.Sprintf(" · rows/batch p50 %s (min %s · max %s)",
+				groupDigits(fmt.Sprintf("%.0f", percentile(rp, 0.5))),
+				groupDigits(fmt.Sprintf("%.0f", rp[0])),
+				groupDigits(fmt.Sprintf("%.0f", rp[len(rp)-1])))
+		}
+		fmt.Fprintln(os.Stderr, rowsLine)
+
+		wireLine := fmt.Sprintf("wire       %s received", fmtBytes(wire))
+		if st.decoded > 0 && wire > 0 {
+			ratio := float64(st.decoded) / float64(wire)
+			wireLine += fmt.Sprintf(" · decodes to %s (%.1f×)", fmtBytes(st.decoded), ratio)
+			if ratio < 1.15 {
+				wireLine += " — stream looks uncompressed"
+			}
+		}
+		fmt.Fprintln(os.Stderr, wireLine)
+		fmt.Fprintf(os.Stderr, "speed      %.0f Mbit/s over the stream\n", mbit)
+
+		// pacing: waits exclude local sink-write time, so the gaps are the
+		// sender + network, not us
+		if len(st.waits) > 0 && st.streamMs > 0 {
+			ws := append([]float64(nil), st.waits...)
+			sort.Float64s(ws)
+			pct := 100 * st.waitTotal / float64(st.streamMs)
+			verdict := "mixed"
+			switch {
+			case pct >= 50:
+				verdict = "paced upstream: sender or network stalls between batches"
+			case pct < 20:
+				verdict = "wire-paced: batches arrive back-to-back"
+			}
+			fmt.Fprintf(os.Stderr, "pacing     gaps p50 %.1f ms · p95 %.1f ms · max %.1f ms — %.0f%% of the stream is waiting (%s)\n",
+				percentile(ws, 0.5), percentile(ws, 0.95), ws[len(ws)-1], pct, verdict)
+		}
+
+		// the stream's type/encoding anatomy — what the columns arrive AS
+		if len(st.colNames) > 0 && st.decoded > 0 {
+			tw := tabwriter.NewWriter(os.Stderr, 2, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "column\ttype\tencoding\tnulls\tdecoded")
+			for i, name := range st.colNames {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s (%.0f%%)\n",
+					name, st.colTypes[i], encodingOf(st.colTypes[i]),
+					groupDigits(fmt.Sprint(st.colNulls[i])), fmtBytes(st.colBytes[i]),
+					100*float64(st.colBytes[i])/float64(st.decoded))
+			}
+			tw.Flush()
+		}
 	} else if s.path != "" {
 		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
 	} else if stdoutIsTTY() {
