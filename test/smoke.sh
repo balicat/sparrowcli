@@ -73,6 +73,24 @@ t md-file 0 "$BIN" sql "SELECT r FROM range(1500) t(r)" -o "$MDF"
 [ "$(grep -c '^|' "$MDF")" = 1502 ] || { echo "FAIL md-file: $(grep -c '^|' "$MDF") lines"; fails=$((fails + 1)); }
 rm -f "$MDF"
 
+# ── check: the data doctor ───────────────────────────────────────────────
+t check-clean 0 "$BIN" check smoke --key id
+has check-rows "rows.*1,000"
+t check-seed 0 "$BIN" sql "CREATE TABLE checkme AS
+SELECT 'OK' AS k, (DATE '2026-06-01' + INTERVAL (r) DAY)::DATE AS t, 100 + r * 1.5 AS v FROM range(30) x(r)
+UNION ALL SELECT 'FLAT', (DATE '2026-06-01' + INTERVAL (r) DAY)::DATE, 7.0 FROM range(15) x(r)
+UNION ALL SELECT 'DUP', DATE '2026-06-05', 1.0 FROM range(2) x(r)" -o csv
+t check-dirty 1 "$BIN" check checkme --key k
+has check-dup "duplicated (k, t)"
+has check-frozen "FLAT"
+t check-json 1 "$BIN" check checkme --key k -o json
+if command -v python3 >/dev/null; then
+  python3 -c "import json; r=json.load(open('$OUT')); assert r['ok'] is False and r['table']=='checkme', r" \
+    || { echo "FAIL check-json-shape"; fails=$((fails + 1)); }
+fi
+t check-missing-table 1 "$BIN" check no_such_table
+t check-usage 3 "$BIN" check
+
 # ── diagnostics ──────────────────────────────────────────────────────────
 t doctor 0 "$BIN" doctor
 t doctor-json 0 "$BIN" doctor -o json
@@ -125,6 +143,7 @@ fi
 
 # ── cleanup ──────────────────────────────────────────────────────────────
 "$BIN" sql "DROP TABLE smoke" -o csv >/dev/null 2>&1
+"$BIN" sql "DROP TABLE checkme" -o csv >/dev/null 2>&1
 rm -f "$OUT" "$ERR"
 
 echo

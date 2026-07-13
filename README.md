@@ -34,6 +34,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
+| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers | server-side SQL aggregates — the table is never downloaded |
 | `sparrow ping` | latency percentiles: bare TCP vs warm-channel RPC — the gap is the server | repeated no-match `GetTables` on one channel |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
@@ -152,6 +153,36 @@ Stats go to stderr, so they compose with every output format and pipe.
 Every benchmark number this project publishes is reproducible with this flag.
 `ping -o json` for scripts; both work against any Flight SQL server.
 
+## Check — a doctor for the data itself
+
+`sparrow check <table>` runs a statistical health screen **server-side** —
+every check is one conservative SQL aggregate, the table is never downloaded,
+and anything a dialect rejects degrades to a skip instead of aborting:
+
+```
+$ sparrow check checkme --key k --max-age 7d
+ ✓ table     3 columns · key k · time t (auto-detected)
+ ✓ rows      60
+ ✓ nulls     v 8.3%
+ ✗ keys      1 duplicated (k, t) groups
+             e.g. DUP
+ ⚠ time      t spans 2026-06-01 → 2026-06-30 · newest point 13.7 days old
+             hint: older than --max-age 7d — is the feed still running?
+ ✓ coverage  5 entities · rows per entity: min 1 · avg 12 · max 30
+ ⚠ frozen    1 entities have a constant v across ≥10 observations
+             e.g. FLAT
+ ✓ numeric   v: min 1 · max 900000 · avg 16432.25
+
+5 ok · 2 warn · 1 fail — checked in 0.0 s (10 queries, server-side)
+```
+
+`--key` names the entity key (uniqueness is checked on *(key, time)* when
+`--time` is set, and temporal columns are auto-detected). Duplicate keys and
+NULLs in key columns are failures and exit `1` — `sparrow check t --key id &&
+deploy` works as a data gate in CI. Staleness, frozen series (a constant
+value across ≥10 observations — a stuck feed's signature), dead columns and
+σ-outliers are warnings. `-o json` for pipelines and agents.
+
 ## Install
 
 Download a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
@@ -193,6 +224,8 @@ Conventions agents can rely on:
 - `sparrow ping -o json` (latency percentiles, network-vs-server split) and
   `sql --stats` (timing/throughput anatomy on stderr) make measurements
   scriptable too.
+- `sparrow check <table> --key id -o json` screens a dataset's health without
+  downloading it — exit `1` means findings, so it gates pipelines.
 - `-o md` **to stdout** caps at 1,000 rows by default so a careless `SELECT *`
   can't flood a context window (the true total reports on stderr; `--max-rows`
   overrides). File sinks and data formats (csv/jsonl/json/arrow/parquet)

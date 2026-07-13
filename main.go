@@ -45,7 +45,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.6.1-dev"
+var version = "0.7.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -1297,6 +1297,7 @@ type checkResult struct {
 type doctorReport struct {
 	Endpoint string        `json:"endpoint"`
 	Profile  string        `json:"profile"`
+	Table    string        `json:"table,omitempty"`
 	Checks   []checkResult `json:"checks"`
 	OK       bool          `json:"ok"`
 }
@@ -1863,6 +1864,7 @@ usage:
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
+  sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
   sparrow profiles [use <name> | rm <name>]
   sparrow version
@@ -1894,6 +1896,8 @@ func main() {
 		err = cmdOrient(os.Args[2:])
 	case "sql":
 		err = cmdSQL(os.Args[2:])
+	case "check":
+		err = cmdCheck(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "ping":
@@ -1916,6 +1920,8 @@ func main() {
 				err = cmdOrient([]string{"-h"})
 			case "sql":
 				err = cmdSQL([]string{"-h"})
+			case "check":
+				err = cmdCheck([]string{"-h"})
 			case "doctor":
 				err = cmdDoctor([]string{"-h"})
 			case "ping":
