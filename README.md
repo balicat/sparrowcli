@@ -32,7 +32,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
 | `sparrow ls [pattern]` | list tables | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
-| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers | server-side SQL aggregates — the table is never downloaded |
 | `sparrow ping` | latency percentiles: bare TCP vs warm-channel RPC — the gap is the server | repeated no-match `GetTables` on one channel |
