@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - run: go vet ./...
+      - run: go test ./...
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - run: go build -o sparrow .
+      - name: start gizmosql fixture
+        run: |
+          docker run -d --name gizmosql -p 31337:31337 \
+            -e TLS_ENABLED=1 \
+            -e GIZMOSQL_USERNAME=gizmosql_username \
+            -e GIZMOSQL_PASSWORD=gizmosql_password \
+            gizmodata/gizmosql:latest
+          for i in $(seq 1 60); do
+            ./sparrow sql "SELECT 1" -s grpc+tls://localhost:31337 \
+              --basic gizmosql_username:gizmosql_password --tls-skip-verify \
+              -o csv >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "gizmosql did not become ready"
+          docker logs gizmosql | tail -30
+          exit 1
+      - run: pip install pyarrow
+      - run: bash test/smoke.sh
