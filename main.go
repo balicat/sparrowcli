@@ -14,8 +14,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -38,7 +40,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.4.0-dev"
+var version = "0.5.0-dev"
 
 // ── profiles ────────────────────────────────────────────────────────────
 
@@ -107,6 +109,33 @@ func parseURI(uri string) (target string, useTLS bool, err error) {
 	}
 }
 
+// tlsConfigFor builds the profile's TLS client config (skip-verify, mTLS
+// keypair, custom CA) — shared by dial() and doctor's handshake stage.
+func tlsConfigFor(p Profile) (*tls.Config, error) {
+	tc := &tls.Config{
+		InsecureSkipVerify: p.TLSSkipVerify, // GizmoSQL ships self-signed by default
+	}
+	if p.TLSCert != "" || p.TLSKey != "" {
+		pair, err := tls.LoadX509KeyPair(p.TLSCert, p.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("mTLS keypair: %w", err)
+		}
+		tc.Certificates = []tls.Certificate{pair}
+	}
+	if p.TLSCA != "" {
+		pem, err := os.ReadFile(p.TLSCA)
+		if err != nil {
+			return nil, fmt.Errorf("tls-ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("tls-ca: no PEM certificates in %s", p.TLSCA)
+		}
+		tc.RootCAs = pool
+	}
+	return tc, nil
+}
+
 func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, error) {
 	target, useTLS, err := parseURI(p.URI)
 	if err != nil {
@@ -114,26 +143,9 @@ func dial(ctx context.Context, p Profile) (*flightsql.Client, context.Context, e
 	}
 	var creds grpc.DialOption
 	if useTLS {
-		tc := &tls.Config{
-			InsecureSkipVerify: p.TLSSkipVerify, // GizmoSQL ships self-signed by default
-		}
-		if p.TLSCert != "" || p.TLSKey != "" {
-			pair, err := tls.LoadX509KeyPair(p.TLSCert, p.TLSKey)
-			if err != nil {
-				return nil, ctx, connError{fmt.Errorf("mTLS keypair: %w", err)}
-			}
-			tc.Certificates = []tls.Certificate{pair}
-		}
-		if p.TLSCA != "" {
-			pem, err := os.ReadFile(p.TLSCA)
-			if err != nil {
-				return nil, ctx, connError{fmt.Errorf("tls-ca: %w", err)}
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				return nil, ctx, connError{fmt.Errorf("tls-ca: no PEM certificates in %s", p.TLSCA)}
-			}
-			tc.RootCAs = pool
+		tc, err := tlsConfigFor(p)
+		if err != nil {
+			return nil, ctx, connError{err}
 		}
 		creds = grpc.WithTransportCredentials(credentials.NewTLS(tc))
 	} else {
@@ -1161,6 +1173,442 @@ func cmdProfiles(args []string) error {
 	return w.Flush()
 }
 
+// ── doctor ──────────────────────────────────────────────────────────────
+//
+// Connection failures all look the same from a client ("connection error")
+// but live at different layers: DNS, a closed port, a TLS interceptor, a
+// proxy that won't speak h2, rejected credentials. doctor walks the stack
+// one layer at a time and names the one that breaks.
+
+type checkResult struct {
+	Check  string   `json:"check"`
+	Status string   `json:"status"` // ok | warn | fail | skip
+	Detail string   `json:"detail,omitempty"`
+	Lines  []string `json:"lines,omitempty"` // extra evidence (e.g. presented cert chain)
+	Hint   string   `json:"hint,omitempty"`
+	Ms     int64    `json:"ms,omitempty"`
+}
+
+type doctorReport struct {
+	Endpoint string        `json:"endpoint"`
+	Profile  string        `json:"profile"`
+	Checks   []checkResult `json:"checks"`
+	OK       bool          `json:"ok"`
+}
+
+type doctor struct {
+	rep              doctorReport
+	json             bool
+	oks, warns, fails int
+	firstFail        string
+}
+
+var statusMark = map[string]string{"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
+
+func (d *doctor) emit(r checkResult) {
+	d.rep.Checks = append(d.rep.Checks, r)
+	switch r.Status {
+	case "ok":
+		d.oks++
+	case "warn":
+		d.warns++
+	case "fail":
+		d.fails++
+		if d.firstFail == "" {
+			d.firstFail = r.Check
+		}
+	}
+	if d.json {
+		return
+	}
+	line := fmt.Sprintf(" %s %-9s %s", statusMark[r.Status], r.Check, r.Detail)
+	if r.Ms > 0 {
+		line += fmt.Sprintf(" (%d ms)", r.Ms)
+	}
+	fmt.Println(line)
+	for _, l := range r.Lines {
+		fmt.Println("             " + l)
+	}
+	if r.Hint != "" {
+		fmt.Println("             hint: " + r.Hint)
+	}
+}
+
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	}
+	return fmt.Sprintf("TLS 0x%04x", v)
+}
+
+func certLine(c *x509.Certificate) string {
+	subj := c.Subject.CommonName
+	if subj == "" && len(c.DNSNames) > 0 {
+		subj = c.DNSNames[0]
+	}
+	iss := c.Issuer.CommonName
+	if len(c.Issuer.Organization) > 0 {
+		iss += " (" + c.Issuer.Organization[0] + ")"
+	}
+	return fmt.Sprintf("subject %q · issuer %q · expires %s", subj, iss,
+		c.NotAfter.Format("2006-01-02"))
+}
+
+// interceptorNames — TLS interception products (AV HTTPS scanning, corporate
+// proxies) that re-sign traffic with a locally-trusted root. A verified chain
+// whose issuer matches one means the server's real certificate never reached
+// this machine.
+var interceptorNames = []string{
+	"Norton", "Avast", "AVG ", "Kaspersky", "ESET", "Bitdefender", "McAfee",
+	"Sophos", "Zscaler", "Fortinet", "FortiGate", "Blue Coat", "Forcepoint",
+	"Palo Alto", "WatchGuard", "Web/Mail Shield",
+}
+
+func interceptorIn(chain []*x509.Certificate) string {
+	for _, c := range chain {
+		iss := c.Issuer.CommonName + " " + strings.Join(c.Issuer.Organization, " ")
+		for _, n := range interceptorNames {
+			if strings.Contains(iss, n) {
+				return strings.TrimSpace(n)
+			}
+		}
+	}
+	return ""
+}
+
+// grpcCode unwraps connError and wrapped errors down to the gRPC status code.
+func grpcCode(err error) codes.Code {
+	var ce connError
+	if errors.As(err, &ce) {
+		err = ce.err
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Code()
+	}
+	return codes.Unknown
+}
+
+// connHint maps well-known transport error texts to an actionable next step.
+func connHint(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "certificate required"), strings.Contains(msg, "bad certificate"):
+		return "the server demands a client certificate (mTLS) — pass --tls-cert / --tls-key"
+	case strings.Contains(msg, "unknown authority"):
+		return "the certificate isn't signed by a CA this machine trusts — pass --tls-ca (or --tls-skip-verify for dev)"
+	case strings.Contains(msg, "deadline exceeded"):
+		return "TCP connects but the RPC hangs — an HTTP/1.1-only proxy in the path, or not a gRPC port?"
+	}
+	return ""
+}
+
+func cmdDoctor(args []string) error {
+	fs := newFlagSet("doctor", `usage: sparrow doctor [flags]
+staged diagnosis of a Flight SQL endpoint: config → dns → tcp → tls → auth →
+flight sql → round trip. Names the layer that breaks and shows what the wire
+actually presented (TLS version, ALPN, certificate chain).
+examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
+	cf := addConnFlags(fs)
+	output := fs.String("o", "", `output: "json" for a machine-readable report`)
+	parseFlags(fs, args)
+	d := &doctor{}
+	switch strings.ToLower(*output) {
+	case "":
+	case "json":
+		d.json = true
+	default:
+		return fmt.Errorf(`doctor -o supports only "json"`)
+	}
+
+	t0 := time.Now()
+	finish := func() error {
+		d.rep.OK = d.fails == 0
+		if d.json {
+			b, _ := json.MarshalIndent(d.rep, "", "  ")
+			fmt.Println(string(b))
+		} else {
+			fmt.Println()
+			line := fmt.Sprintf("%d ok · %d warn · %d fail", d.oks, d.warns, d.fails)
+			if d.fails == 0 {
+				fmt.Printf("%s — healthy in %d ms\n", line, time.Since(t0).Milliseconds())
+			} else {
+				fmt.Printf("%s — first failure at %s\n", line, d.firstFail)
+			}
+		}
+		if d.fails > 0 {
+			return connError{fmt.Errorf("doctor: %d check(s) failed (first: %s)", d.fails, d.firstFail)}
+		}
+		return nil
+	}
+	// stages after config, for skip bookkeeping on early bail
+	stages := []string{"dns", "tcp", "tls", "auth", "flightsql", "roundtrip"}
+	skipFrom := func(i int) {
+		for _, n := range stages[i:] {
+			d.emit(checkResult{Check: n, Status: "skip", Detail: "not reached"})
+		}
+	}
+
+	// 1 · config — profile, URI, key material, config file permissions
+	p, pname, err := cf.resolve()
+	if err != nil {
+		d.emit(checkResult{Check: "config", Status: "fail", Detail: err.Error()})
+		skipFrom(0)
+		return finish()
+	}
+	d.rep.Endpoint, d.rep.Profile = p.URI, pname
+	if !d.json {
+		fmt.Printf("sparrow doctor — %s (profile: %s)\n\n", p.URI, pname)
+	}
+	target, useTLS, err := parseURI(p.URI)
+	if err != nil {
+		d.emit(checkResult{Check: "config", Status: "fail", Detail: err.Error()})
+		skipFrom(0)
+		return finish()
+	}
+	if _, err := tlsConfigFor(p); err != nil {
+		d.emit(checkResult{Check: "config", Status: "fail", Detail: err.Error(),
+			Hint: "fix the --tls-cert/--tls-key/--tls-ca paths (or the profile's tls_* fields)"})
+		skipFrom(0)
+		return finish()
+	}
+	cfgDetail := fmt.Sprintf("profile %q · auth %s", pname, p.Auth)
+	switch {
+	case !useTLS:
+		cfgDetail += " · plaintext"
+	case p.TLSSkipVerify:
+		cfgDetail += " · TLS skip-verify"
+	case p.TLSCA != "":
+		cfgDetail += " · TLS custom CA"
+	default:
+		cfgDetail += " · TLS system roots"
+	}
+	if p.TLSCert != "" {
+		cfgDetail += " + mTLS client cert"
+	}
+	cfgStatus, cfgHint := "ok", ""
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(configPath()); err == nil && fi.Mode().Perm()&0o077 != 0 {
+			cfgStatus = "warn"
+			cfgHint = configPath() + " is group/world-readable and holds credentials — chmod 600"
+		}
+	}
+	d.emit(checkResult{Check: "config", Status: cfgStatus, Detail: cfgDetail, Hint: cfgHint})
+
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+
+	// 2 · dns
+	if net.ParseIP(host) != nil {
+		d.emit(checkResult{Check: "dns", Status: "skip", Detail: host + " is an IP literal"})
+	} else {
+		td := time.Now()
+		dnsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		addrs, err := net.DefaultResolver.LookupHost(dnsCtx, host)
+		cancel()
+		if err != nil {
+			d.emit(checkResult{Check: "dns", Status: "fail", Detail: err.Error(),
+				Hint: "the name doesn't resolve — typo, or the DNS record hasn't propagated?"})
+			skipFrom(1)
+			return finish()
+		}
+		show := addrs
+		if len(show) > 3 {
+			show = show[:3]
+		}
+		d.emit(checkResult{Check: "dns", Status: "ok",
+			Detail: fmt.Sprintf("%s → %s", host, strings.Join(show, ", ")),
+			Ms:     time.Since(td).Milliseconds()})
+	}
+
+	// 3 · tcp
+	td := time.Now()
+	rawConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		d.emit(checkResult{Check: "tcp", Status: "fail", Detail: err.Error(),
+			Hint: "nothing accepted the connection — wrong port, service down, or a firewall dropping it"})
+		skipFrom(2)
+		return finish()
+	}
+	remote := rawConn.RemoteAddr().String()
+	rawConn.Close()
+	d.emit(checkResult{Check: "tcp", Status: "ok", Detail: "connected to " + remote,
+		Ms: time.Since(td).Milliseconds()})
+
+	// 4 · tls — handshake with the profile's config + ALPN h2; on a verify
+	// failure, handshake once more WITHOUT verification purely to report what
+	// the wire actually presented (exposes TLS interceptors and wrong certs)
+	if !useTLS {
+		st, hint := "skip", ""
+		det := "plaintext grpc:// — no TLS layer"
+		if p.Auth != "none" {
+			st = "warn"
+			det += "; credentials cross the network unencrypted"
+			hint = "use grpc+tls:// if the server offers it"
+		}
+		d.emit(checkResult{Check: "tls", Status: st, Detail: det, Hint: hint})
+	} else {
+		tc, _ := tlsConfigFor(p) // validated in the config stage
+		tc.NextProtos = []string{"h2"}
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		td = time.Now()
+		conn, err := tls.DialWithDialer(dialer, "tcp", target, tc)
+		if err != nil {
+			r := checkResult{Check: "tls", Status: "fail", Detail: err.Error(),
+				Hint: connHint(err)}
+			insecureTC := tc.Clone()
+			insecureTC.InsecureSkipVerify = true
+			if c2, err2 := tls.DialWithDialer(dialer, "tcp", target, insecureTC); err2 == nil {
+				cs := c2.ConnectionState()
+				c2.Close()
+				for i, cert := range cs.PeerCertificates {
+					if i >= 3 {
+						break
+					}
+					r.Lines = append(r.Lines, "wire presented: "+certLine(cert))
+				}
+				if strings.Contains(err.Error(), "unknown authority") {
+					r.Hint = "if that issuer is not your server's CA, something between you and the " +
+						"server is intercepting TLS (antivirus HTTPS scanning, corporate proxy)"
+				}
+			}
+			d.emit(r)
+			skipFrom(3)
+			return finish()
+		}
+		cs := conn.ConnectionState()
+		conn.Close()
+		st, hint := "ok", ""
+		var lines []string
+		det := tlsVersionName(cs.Version) + " · ALPN " + cs.NegotiatedProtocol
+		if len(cs.PeerCertificates) > 0 {
+			leaf := cs.PeerCertificates[0]
+			days := int(time.Until(leaf.NotAfter).Hours() / 24)
+			det += fmt.Sprintf(" · %s (%d days left)", certLine(leaf), days)
+			if days < 14 {
+				st, hint = "warn", "the server certificate expires soon"
+			}
+		}
+		switch {
+		case cs.NegotiatedProtocol != "h2":
+			st = "fail"
+			hint = "the server didn't negotiate ALPN h2 — gRPC requires it (grpc-go ≥1.67 enforces " +
+				"this). Envoy: add alpn_protocols: [h2] to the listener's transport socket."
+		case p.TLSSkipVerify:
+			st = "warn"
+			lines = append(lines, "certificate chain NOT verified (--tls-skip-verify)")
+		case interceptorIn(cs.PeerCertificates) != "":
+			st = "warn"
+			lines = append(lines, "the chain verifies, but the issuer is a TLS interception product ("+
+				interceptorIn(cs.PeerCertificates)+") — the server's real certificate is being replaced in transit")
+			hint = "antivirus HTTPS scanning or a corporate proxy is decrypting this connection; " +
+				"exclude this host from interception to see the server's own certificate"
+		}
+		d.emit(checkResult{Check: "tls", Status: st, Detail: det, Lines: lines, Hint: hint,
+			Ms: time.Since(td).Milliseconds()})
+		if st == "fail" {
+			skipFrom(3)
+			return finish()
+		}
+	}
+
+	// 5 · auth — dial (basic auth handshakes here) · 6 · flight sql — first RPC
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	td = time.Now()
+	cl, ctx, err := dial(ctx, p)
+	if err != nil {
+		r := checkResult{Check: "auth", Status: "fail", Detail: err.Error(), Hint: connHint(err)}
+		if grpcCode(err) == codes.Unauthenticated {
+			r.Hint = "the server rejected the credentials — check user/pass or the token"
+		}
+		d.emit(r)
+		skipFrom(4)
+		return finish()
+	}
+	defer cl.Close()
+	authMs := time.Since(td).Milliseconds()
+	authDetail := map[string]string{
+		"basic":  "basic handshake accepted",
+		"bearer": "bearer token attached (validated at the first RPC)",
+		"none":   "no credentials configured",
+	}[p.Auth]
+
+	td = time.Now()
+	tinfo, err := cl.GetTables(ctx, &flightsql.GetTablesOpts{})
+	var ntables int64
+	if err == nil {
+		ntables, err = countRows(ctx, cl, tinfo)
+	}
+	if err != nil {
+		if grpcCode(err) == codes.Unauthenticated {
+			d.emit(checkResult{Check: "auth", Status: "fail", Detail: err.Error(),
+				Hint: "the server rejected the credentials at the first RPC — wrong or expired token?"})
+			skipFrom(4)
+			return finish()
+		}
+		d.emit(checkResult{Check: "auth", Status: "ok", Detail: authDetail, Ms: authMs})
+		d.emit(checkResult{Check: "flightsql", Status: "fail", Detail: err.Error(),
+			Hint: connHint(err)})
+		skipFrom(5)
+		return finish()
+	}
+	d.emit(checkResult{Check: "auth", Status: "ok", Detail: authDetail, Ms: authMs})
+	vendor := strings.TrimSpace(probeVendor(ctx, cl))
+	if vendor == "" {
+		vendor = "vendor info unsupported"
+	}
+	d.emit(checkResult{Check: "flightsql", Status: "ok",
+		Detail: fmt.Sprintf("%s · %d tables visible via GetTables", vendor, ntables),
+		Ms:     time.Since(td).Milliseconds()})
+
+	// 7 · round trip — no alias on the FROM-less SELECT (Dremio)
+	td = time.Now()
+	qinfo, err := cl.Execute(ctx, "SELECT 1")
+	var nrows int64
+	if err == nil {
+		nrows, err = countRows(ctx, cl, qinfo)
+	}
+	if err != nil {
+		d.emit(checkResult{Check: "roundtrip", Status: "warn",
+			Detail: "GetTables works but SELECT 1 failed: " + err.Error(),
+			Hint:   "some servers restrict FROM-less SELECTs — try a real query against a table"})
+	} else {
+		d.emit(checkResult{Check: "roundtrip", Status: "ok",
+			Detail: fmt.Sprintf("SELECT 1 → %d row(s)", nrows),
+			Ms:     time.Since(td).Milliseconds()})
+	}
+	return finish()
+}
+
+// countRows drains a FlightInfo's endpoints and counts the rows.
+func countRows(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo) (int64, error) {
+	var n int64
+	for _, ep := range info.Endpoint {
+		rdr, err := cl.DoGet(ctx, ep.Ticket)
+		if err != nil {
+			return n, err
+		}
+		for rdr.Next() {
+			n += rdr.Record().NumRows()
+		}
+		err = rdr.Err()
+		rdr.Release()
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
 func usage() {
 	fmt.Println(`sparrow ` + version + ` — Arrow Flight data. At the speed of the command line.
 
@@ -1171,6 +1619,7 @@ usage:
   sparrow info <table> [-s profile] [--no-count]
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
+  sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow profiles [use <name> | rm <name>]
   sparrow version
 
@@ -1201,6 +1650,8 @@ func main() {
 		err = cmdOrient(os.Args[2:])
 	case "sql":
 		err = cmdSQL(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
 	case "profiles":
 		err = cmdProfiles(os.Args[2:])
 	case "version":
@@ -1219,6 +1670,8 @@ func main() {
 				err = cmdOrient([]string{"-h"})
 			case "sql":
 				err = cmdSQL([]string{"-h"})
+			case "doctor":
+				err = cmdDoctor([]string{"-h"})
 			default:
 				usage()
 			}

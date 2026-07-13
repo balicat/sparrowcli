@@ -31,6 +31,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow ls [pattern]` | list tables | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth — the two adapters that cover the whole tested landscape:
@@ -83,6 +84,33 @@ DuckDB, Spark and pyarrow read the file back with the key — and refuse it
 without. Verified against an Envoy that requires client certificates: no
 cert → refused (exit 2); cert → query runs.
 
+## Doctor — when the connection doesn't work
+
+Every connection failure looks the same from a client: "connection error."
+`sparrow doctor` walks the stack — config → DNS → TCP → TLS → auth → Flight
+SQL → round trip — and names the layer that breaks, with evidence:
+
+```
+$ sparrow doctor -s grpc+tls://fixture:31337 --basic user:pass
+ ✓ config    profile "(ad-hoc)" · auth basic · TLS system roots
+ ✓ dns       fixture → 192.168.132.91 (18 ms)
+ ✓ tcp       connected to 192.168.132.91:31337 (2 ms)
+ ✗ tls       tls: failed to verify certificate: x509: certificate signed by unknown authority
+             wire presented: subject "localhost" · issuer "Norton Web/Mail Shield Untrusted Root"
+             hint: if that issuer is not your server's CA, something between you and the
+             server is intercepting TLS (antivirus HTTPS scanning, corporate proxy)
+ · auth      not reached
+
+3 ok · 0 warn · 1 fail — first failure at tls
+```
+
+That capture is real — a self-signed fixture that "wouldn't verify" turned out
+to be local antivirus re-signing the connection, and doctor shows the swapped
+certificate straight off the wire. On a healthy endpoint it reports the TLS
+version, ALPN (gRPC needs `h2`; doctor says so when a proxy won't negotiate
+it), certificate issuer and expiry, the auth handshake, the vendor, and a
+timed round trip. `-o json` for scripts; exit `2` if any layer fails.
+
 ## Install
 
 Download a binary from [the releases page](https://github.com/balicat/sparrowcli/releases)
@@ -117,6 +145,8 @@ Conventions agents can rely on:
   ANSI, no decoration; row-count and timing summaries go to **stderr**.
 - Exit codes: `0` ok · `1` query error · `2` connection/auth · `3` usage —
   branch on "server down" vs "my SQL was wrong".
+- On exit `2`, run `sparrow doctor -o json` — a layer-by-layer diagnosis
+  (DNS, TCP, TLS/ALPN, auth) as structured JSON, instead of guessing.
 - `-o md` caps at 1,000 rows by default so a careless `SELECT *` can't flood
   a context window (the true total reports on stderr; `--max-rows` overrides).
   Data formats (csv/jsonl/json/arrow/parquet) always emit everything.
