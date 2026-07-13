@@ -168,6 +168,9 @@ measured excluding the client's own write time, so a slow local sink doesn't
 skew the verdict. Run the same pull against two servers and the differences
 name themselves.
 
+Prefer the raw view? `sql --ipc` prints the message-by-message IPC manifest
+instead: type, rows, body bytes, declared codec, custom metadata.
+
 Stats go to stderr, so they compose with every output format and pipe.
 Every benchmark number this project publishes is reproducible with this flag.
 `ping -o json` for scripts; both work against any Flight SQL server.
