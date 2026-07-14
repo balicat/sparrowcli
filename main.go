@@ -1146,6 +1146,12 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		return usagef(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
+	return execStatement(cf, query, *output, *encKey, *maxRows, *statsOn, *ipcOn)
+}
+
+// execStatement is the shared execution core behind sql and query:
+// dial, run, sink, and the optional --stats / --ipc reports.
+func execStatement(cf *connFlags, query, output, encKey string, maxRows int, statsOn, ipcOn bool) error {
 	p, _, err := cf.resolve()
 	if err != nil {
 		return err
@@ -1154,9 +1160,9 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	defer cancel()
 	var counter *byteCounter
 	var extra []grpc.DialOption
-	if *statsOn || *ipcOn {
+	if statsOn || ipcOn {
 		counter = &byteCounter{}
-		if *ipcOn {
+		if ipcOn {
 			counter.capN = 128
 		}
 		extra = append(extra, grpc.WithStatsHandler(counter))
@@ -1177,15 +1183,15 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	if counter != nil {
 		wireAtPlan = counter.in.Load()
 	}
-	s, err := resolveSink(*output)
+	s, err := resolveSink(output)
 	if err != nil {
 		return err
 	}
-	if *encKey != "" {
+	if encKey != "" {
 		if s.format != "parquet" {
 			return fmt.Errorf("--encrypt-key only applies to parquet output (-o data.parquet)")
 		}
-		k, err := loadKey(*encKey)
+		k, err := loadKey(encKey)
 		if err != nil {
 			return err
 		}
@@ -1196,14 +1202,14 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		s.encKey = k
 	}
 	var st *qstats
-	if *statsOn {
+	if statsOn {
 		st = &qstats{}
 	}
-	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(*maxRows, s.format, 40, s.path != ""), st)
+	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(maxRows, s.format, 40, s.path != ""), st)
 	if err != nil {
 		return err
 	}
-	if *statsOn {
+	if statsOn {
 		wire := counter.in.Load() - wireAtPlan // DoGet payloads only
 		var mbit float64
 		if st.streamMs > 0 {
@@ -1274,7 +1280,7 @@ total                 %6d ms
 			tw.Flush()
 		}
 	}
-	if *ipcOn {
+	if ipcOn {
 		hdrs := counter.snapshotHeaders()
 		total := counter.msgs.Load()
 		fmt.Fprintln(os.Stderr, "── ipc messages ────────────────────────")
@@ -1306,14 +1312,14 @@ total                 %6d ms
 			fmt.Fprintf(os.Stderr, "… %s messages total (first %d shown)\n", groupDigits(fmt.Sprint(total)), shown)
 		}
 	}
-	if *statsOn {
+	if statsOn {
 		// --stats prints its own rows line above
 	} else if s.path != "" {
 		fmt.Fprintf(os.Stderr, "✓ %d rows → %s in %d ms\n", total, s.path, time.Since(t0).Milliseconds())
 	} else if stdoutIsTTY() {
 		fmt.Fprintf(os.Stderr, "✓ %d rows in %d ms\n", total, time.Since(t0).Milliseconds())
 	}
-	if s.path != "" && *statsOn {
+	if s.path != "" && statsOn {
 		fmt.Fprintf(os.Stderr, "✓ → %s\n", s.path)
 	}
 	return nil
@@ -2279,6 +2285,7 @@ usage:
   sparrow info <table> [-s profile] [--no-count]
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats] [--ipc]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
+  sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
@@ -2313,6 +2320,8 @@ func main() {
 		err = cmdOrient(os.Args[2:])
 	case "sql":
 		err = cmdSQL(os.Args[2:])
+	case "query":
+		err = cmdQuery(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	case "doctor":
@@ -2339,6 +2348,8 @@ func main() {
 				err = cmdOrient([]string{"-h"})
 			case "sql":
 				err = cmdSQL([]string{"-h"})
+			case "query":
+				err = cmdQuery([]string{"-h"})
 			case "check":
 				err = cmdCheck([]string{"-h"})
 			case "doctor":
