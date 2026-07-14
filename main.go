@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,7 +48,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.10.0-dev"
+var version = "0.11.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -454,7 +455,14 @@ type recordWriter struct {
 	iw      *ipc.Writer
 	pw      *pqarrow.FileWriter
 	jsonAny bool
+	// sparkline sampling (table on a TTY): numeric columns are sampled from
+	// the FULL stream, so the preview covers what the row cap hides
+	sparkCols []int       // schema indices of the sampled columns (≤3)
+	samples   [][]float64 // parallel to sparkCols, capped at sparkCap each
+	sparkDone bool
 }
+
+const sparkCap = 4096
 
 func (rw *recordWriter) begin(schema *arrow.Schema) error {
 	rw.schema = schema
@@ -466,6 +474,20 @@ func (rw *recordWriter) begin(schema *arrow.Schema) error {
 	case "table":
 		rw.tw = tabwriter.NewWriter(rw.s.w, 2, 4, 2, ' ', 0)
 		fmt.Fprintln(rw.tw, strings.Join(heads, "\t"))
+		if stdoutIsTTY() {
+			for i, f := range schema.Fields() {
+				if len(rw.sparkCols) >= 3 {
+					break
+				}
+				switch f.Type.ID() {
+				case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64,
+					arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64,
+					arrow.FLOAT32, arrow.FLOAT64:
+					rw.sparkCols = append(rw.sparkCols, i)
+				}
+			}
+			rw.samples = make([][]float64, len(rw.sparkCols))
+		}
 	case "md":
 		fmt.Fprintln(rw.s.w, "| "+strings.Join(mdEscape(heads), " | ")+" |")
 		sep := make([]string, len(heads))
@@ -503,6 +525,9 @@ func (rw *recordWriter) begin(schema *arrow.Schema) error {
 
 func (rw *recordWriter) write(rec arrow.Record) error {
 	rw.total += rec.NumRows()
+	if len(rw.sparkCols) > 0 && !rw.sparkDone {
+		rw.sample(rec) // from the full record, before any maxRows slicing
+	}
 	emit := rec
 	if rw.maxRows > 0 {
 		remain := int64(rw.maxRows) - rw.written
@@ -579,7 +604,11 @@ func (rw *recordWriter) end() error {
 	}
 	switch rw.s.format {
 	case "table":
-		return rw.tw.Flush()
+		if err := rw.tw.Flush(); err != nil {
+			return err
+		}
+		rw.sparklines()
+		return nil
 	case "csv":
 		rw.cw.Flush()
 		return rw.cw.Error()
@@ -597,6 +626,100 @@ func (rw *recordWriter) end() error {
 	return nil
 }
 
+// sample collects numeric values for the sparkline, in arrival order.
+func (rw *recordWriter) sample(rec arrow.Record) {
+	done := true
+	for si, ci := range rw.sparkCols {
+		if ci >= int(rec.NumCols()) || len(rw.samples[si]) >= sparkCap {
+			continue
+		}
+		col := rec.Column(ci)
+		for r := 0; r < int(rec.NumRows()) && len(rw.samples[si]) < sparkCap; r++ {
+			if col.IsNull(r) {
+				continue
+			}
+			if f, err := strconv.ParseFloat(cell(col, r), 64); err == nil &&
+				!math.IsNaN(f) && !math.IsInf(f, 0) {
+				rw.samples[si] = append(rw.samples[si], f)
+			}
+		}
+		if len(rw.samples[si]) < sparkCap {
+			done = false
+		}
+	}
+	rw.sparkDone = done
+}
+
+// sparklines draws the shape of each sampled column under the table — the
+// row cap shows 40 rows, the sparkline shows the whole stream.
+func (rw *recordWriter) sparklines() {
+	tw := tabwriter.NewWriter(rw.s.w, 2, 4, 2, ' ', 0)
+	any := false
+	for si, ci := range rw.sparkCols {
+		vals := rw.samples[si]
+		if len(vals) < 8 {
+			continue
+		}
+		lo, hi := vals[0], vals[0]
+		for _, v := range vals[1:] {
+			if v < lo {
+				lo = v
+			}
+			if v > hi {
+				hi = v
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\tmin %s · max %s\n", rw.schema.Field(ci).Name,
+			spark(vals, 50), strconv.FormatFloat(lo, 'g', 6, 64), strconv.FormatFloat(hi, 'g', 6, 64))
+		any = true
+	}
+	if any {
+		tw.Flush()
+	}
+}
+
+// spark renders vals as a width-char block line; each char is the mean of
+// its bucket, scaled to the means' own min..max for contrast.
+func spark(vals []float64, width int) string {
+	if len(vals) < width {
+		width = len(vals)
+	}
+	means := make([]float64, width)
+	for b := 0; b < width; b++ {
+		lo, hi := b*len(vals)/width, (b+1)*len(vals)/width
+		if hi <= lo {
+			hi = lo + 1
+		}
+		var s float64
+		for _, v := range vals[lo:hi] {
+			s += v
+		}
+		means[b] = s / float64(hi-lo)
+	}
+	mn, mx := means[0], means[0]
+	for _, m := range means[1:] {
+		if m < mn {
+			mn = m
+		}
+		if m > mx {
+			mx = m
+		}
+	}
+	blocks := []rune("▁▂▃▄▅▆▇█")
+	out := make([]rune, width)
+	for i, m := range means {
+		idx := 3 // flat series: mid-height
+		if mx > mn {
+			idx = int((m - mn) / (mx - mn) * 7.999)
+			if idx > 7 {
+				idx = 7
+			}
+		}
+		out[i] = blocks[idx]
+	}
+	return string(out)
+}
+
 // qstats collects the anatomy of a query's data phase for sql --stats:
 // timings, per-batch arrivals (pacing), and the per-column type/encoding/
 // size breakdown of what the stream actually carried.
@@ -612,7 +735,10 @@ type qstats struct {
 	colTypes          []string
 	colBytes          []int64
 	colNulls          []int64
-	decoded           int64 // in-memory bytes after IPC decode (vs wire bytes)
+	decoded           int64        // in-memory bytes after IPC decode (vs wire bytes)
+	wireFn            func() int64 // snapshots DoGet wire bytes (set when a counter is attached)
+	rampMs            []int64      // per-batch arrival time since stream start
+	rampWire          []int64      // wire bytes received by that arrival
 }
 
 // arrayDataSize sums an array's buffer bytes, children and dictionary
@@ -692,6 +818,10 @@ func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
 			st.colNulls[i] += int64(col.NullN())
 		}
 	}
+	if st.wireFn != nil {
+		st.rampMs = append(st.rampMs, now.Sub(tStream).Milliseconds())
+		st.rampWire = append(st.rampWire, st.wireFn())
+	}
 }
 
 // byteCounter is a grpc stats.Handler that counts payload bytes as they cross
@@ -699,11 +829,13 @@ func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
 // keeps the first few FlightData headers so --stats can report the DECLARED
 // IPC body-compression codec, not just infer one from the wire/decode ratio.
 type byteCounter struct {
-	in, out atomic.Int64
-	msgs    atomic.Int64 // FlightData messages seen
-	capN    int          // how many headers to keep (0 → 8)
-	mu      sync.Mutex
-	headers [][]byte
+	in, out     atomic.Int64
+	msgs        atomic.Int64 // FlightData messages seen
+	recBatches  atomic.Int64 // record-batch messages on the stream
+	dictBatches atomic.Int64 // dictionary-batch messages on the stream
+	capN        int          // how many headers to keep (0 → 8)
+	mu          sync.Mutex
+	headers     [][]byte
 }
 
 func (b *byteCounter) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context { return ctx }
@@ -713,6 +845,14 @@ func (b *byteCounter) HandleRPC(_ context.Context, s stats.RPCStats) {
 		b.in.Add(int64(v.WireLength))
 		if fd, ok := v.Payload.(*flight.FlightData); ok && len(fd.DataHeader) > 0 {
 			b.msgs.Add(1)
+			if m, ok := ipcHeaderInfo(fd.DataHeader); ok {
+				switch {
+				case m.Typ == "record batch":
+					b.recBatches.Add(1)
+				case strings.HasPrefix(m.Typ, "dictionary"):
+					b.dictBatches.Add(1)
+				}
+			}
 			b.mu.Lock()
 			max := b.capN
 			if max <= 0 {
@@ -1204,6 +1344,8 @@ func execStatement(cf *connFlags, query, output, encKey string, maxRows int, sta
 	var st *qstats
 	if statsOn {
 		st = &qstats{}
+		base := wireAtPlan
+		st.wireFn = func() int64 { return counter.in.Load() - base }
 	}
 	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(maxRows, s.format, 40, s.path != ""), st)
 	if err != nil {
@@ -1246,8 +1388,30 @@ total                 %6d ms
 			}
 		}
 		fmt.Fprintln(os.Stderr, wireLine)
+		if d := counter.dictBatches.Load(); d > 0 {
+			noun := "batches"
+			if d == 1 {
+				noun = "batch"
+			}
+			fmt.Fprintf(os.Stderr, "dicts      %d dictionary %s on the stream\n", d, noun)
+		}
 		if wire >= 100_000 {
 			fmt.Fprintf(os.Stderr, "speed      %.0f Mbit/s over the stream\n", mbit)
+		}
+		// ramp: how much of the stream landed in the first second vs overall —
+		// on long streams this separates TCP/window warm-up from steady state
+		if st.streamMs >= 2000 && len(st.rampMs) > 0 {
+			var at1s int64
+			for i, ms := range st.rampMs {
+				if ms > 1000 {
+					break
+				}
+				at1s = st.rampWire[i]
+			}
+			if at1s > 0 {
+				fmt.Fprintf(os.Stderr, "ramp       first 1 s %.0f Mbit/s → overall %.0f Mbit/s\n",
+					float64(at1s)*8/1e6, mbit)
+			}
 		}
 
 		// pacing: waits exclude local sink-write time, so the gaps are the
@@ -1838,9 +2002,13 @@ func cmdDoctor(args []string) error {
 staged diagnosis of a Flight SQL endpoint: config → dns → tcp → tls → auth →
 flight sql → round trip. Names the layer that breaks and shows what the wire
 actually presented (TLS version, ALPN, certificate chain).
-examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
+--server swaps the connection diagnosis for a CONFORMANCE CARD: which Flight
+SQL surfaces (GetSqlInfo, catalog RPCs, prepared statements, actions) the
+server implements — informational, always exit 0 once the dial works.
+examples: sparrow doctor · sparrow doctor -s influx -o json · sparrow doctor --server`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", `output: "json" for a machine-readable report`)
+	serverCard := fs.Bool("server", false, "probe the server's Flight SQL surface instead of the connection")
 	parseFlags(fs, args)
 	d := &doctor{}
 	switch strings.ToLower(*output) {
@@ -1849,6 +2017,9 @@ examples: sparrow doctor · sparrow doctor -s influx · sparrow doctor -o json`)
 		d.json = true
 	default:
 		return usagef(`doctor -o supports only "json"`)
+	}
+	if *serverCard {
+		return runConform(cf, d.json)
 	}
 
 	t0 := time.Now()
@@ -2288,9 +2459,11 @@ usage:
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
+  sparrow diff <table> --against <profile|uri>    drift gate: schema·count·bounds vs a second server
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
   sparrow feedback "message" [--category bug]     send feedback to the sparrow maintainers
   sparrow profiles [use <name> | rm <name>]
+  sparrow completion bash|zsh|fish                shell tab-completion script
   sparrow version
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
@@ -2324,6 +2497,8 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "diff":
+		err = cmdDiff(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "ping":
@@ -2332,6 +2507,8 @@ func main() {
 		err = cmdFeedback(os.Args[2:])
 	case "profiles":
 		err = cmdProfiles(os.Args[2:])
+	case "completion":
+		err = cmdCompletion(os.Args[2:])
 	case "version":
 		fmt.Println("sparrow", versionString())
 	case "help", "-h", "--help":
@@ -2352,12 +2529,16 @@ func main() {
 				err = cmdQuery([]string{"-h"})
 			case "check":
 				err = cmdCheck([]string{"-h"})
+			case "diff":
+				err = cmdDiff([]string{"-h"})
 			case "doctor":
 				err = cmdDoctor([]string{"-h"})
 			case "ping":
 				err = cmdPing([]string{"-h"})
 			case "feedback":
 				err = cmdFeedback([]string{"-h"})
+			case "completion":
+				err = cmdCompletion([]string{"-h"})
 			case "profiles":
 				fmt.Println("usage: sparrow profiles              list saved connections (* = default)")
 				fmt.Println("       sparrow profiles use <name>   set the default profile")

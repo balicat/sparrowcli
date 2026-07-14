@@ -1,0 +1,152 @@
+// completion — static shell completion scripts (bash, zsh, fish).
+//
+// The command/flag tables below are maintained BY HAND next to the flag
+// definitions they mirror. That drift risk is accepted: the flag surface is
+// small and changes rarely, and static tables keep the scripts dependency-
+// free and instant. When adding a command or flag, update this file.
+package main
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// connection flags shared by every server-facing command (addConnFlags)
+var connFlagNames = []string{
+	"s", "basic", "bearer", "header", "tls-skip-verify", "tls-cert", "tls-key", "tls-ca",
+}
+
+var cmdDesc = map[string]string{
+	"connect":    "probe a server and save a connection profile",
+	"orient":     "one-shot markdown map: vendor, tables, schemas",
+	"ls":         "list tables",
+	"info":       "table schema + row count",
+	"sql":        "run a Flight SQL statement",
+	"query":      "build and run a simple SELECT",
+	"doctor":     "layered connection diagnosis",
+	"check":      "data-quality checks on a table",
+	"diff":       "compare a table across two servers",
+	"ping":       "latency percentiles: bare TCP vs warm RPC",
+	"feedback":   "send feedback to the sparrow maintainers",
+	"profiles":   "list / use / rm saved profiles",
+	"completion": "print a shell completion script",
+	"version":    "print version",
+	"help":       "help for a command",
+}
+
+// per-command flags beyond the shared connection set (nil = conn flags only)
+var cmdOwnFlags = map[string][]string{
+	"connect":    {"name"},
+	"orient":     nil,
+	"ls":         {"o"},
+	"info":       {"no-count"},
+	"sql":        {"f", "o", "max-rows", "encrypt-key", "stats", "ipc"},
+	"query":      {"cols", "where", "order", "desc", "limit", "o", "max-rows", "encrypt-key", "stats", "ipc"},
+	"doctor":     {"o", "server"},
+	"check":      {"key", "time", "value", "max-age", "strict", "o"},
+	"diff":       {"against", "time", "o"},
+	"ping":       {"n", "o"},
+	"feedback":   {"category", "from"},
+	"profiles":   {},
+	"completion": {},
+	"version":    {},
+	"help":       {},
+}
+
+// serverCmds get the shared connection flags in addition to their own
+var serverCmds = map[string]bool{
+	"connect": true, "orient": true, "ls": true, "info": true, "sql": true,
+	"query": true, "doctor": true, "check": true, "diff": true, "ping": true,
+}
+
+func completionCommands() []string {
+	out := make([]string, 0, len(cmdOwnFlags))
+	for c := range cmdOwnFlags {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func flagsFor(cmd string) []string {
+	var names []string
+	if serverCmds[cmd] {
+		names = append(names, connFlagNames...)
+	}
+	names = append(names, cmdOwnFlags[cmd]...)
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = "--" + n
+	}
+	return out
+}
+
+func cmdCompletion(args []string) error {
+	fs := newFlagSet("completion", `usage: sparrow completion bash|zsh|fish
+print a completion script for your shell; load it with:
+  bash:  source <(sparrow completion bash)      (or drop into bash_completion.d)
+  zsh:   source <(sparrow completion zsh)       (or a file in your $fpath)
+  fish:  sparrow completion fish > ~/.config/fish/completions/sparrow.fish`)
+	pos := parseFlags(fs, args)
+	if len(pos) != 1 {
+		return usagef("usage: sparrow completion bash|zsh|fish")
+	}
+	cmds := completionCommands()
+	switch pos[0] {
+	case "bash":
+		fmt.Println(`# bash completion for sparrow — load with: source <(sparrow completion bash)
+_sparrow() {
+    local cur cmd
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    cmd="${COMP_WORDS[1]}"
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "` + strings.Join(cmds, " ") + `" -- "$cur"))
+        return
+    fi
+    case "$cmd" in`)
+		for _, c := range cmds {
+			if f := flagsFor(c); len(f) > 0 {
+				fmt.Printf("        %s) COMPREPLY=($(compgen -W \"%s\" -- \"$cur\"));;\n", c, strings.Join(f, " "))
+			}
+		}
+		fmt.Println(`    esac
+}
+complete -F _sparrow sparrow`)
+	case "zsh":
+		fmt.Println(`#compdef sparrow
+# zsh completion for sparrow — load with: source <(sparrow completion zsh)
+# (bash-style alternative: autoload bashcompinit && bashcompinit,
+#  then source the bash script instead)
+_sparrow() {
+    if (( CURRENT == 2 )); then
+        compadd ` + strings.Join(cmds, " ") + `
+        return
+    fi
+    case "${words[2]}" in`)
+		for _, c := range cmds {
+			if f := flagsFor(c); len(f) > 0 {
+				fmt.Printf("        %s) compadd -- %s;;\n", c, strings.Join(f, " "))
+			}
+		}
+		fmt.Println(`    esac
+}
+_sparrow "$@"`)
+	case "fish":
+		fmt.Println(`# fish completion for sparrow
+# install: sparrow completion fish > ~/.config/fish/completions/sparrow.fish
+complete -c sparrow -f`)
+		for _, c := range cmds {
+			fmt.Printf("complete -c sparrow -n __fish_use_subcommand -a %s -d %q\n", c, cmdDesc[c])
+		}
+		for _, c := range cmds {
+			for _, f := range flagsFor(c) {
+				fmt.Printf("complete -c sparrow -n \"__fish_seen_subcommand_from %s\" -o %s\n",
+					c, strings.TrimPrefix(f, "--"))
+			}
+		}
+	default:
+		return usagef("unknown shell %q (bash, zsh, fish)", pos[0])
+	}
+	return nil
+}

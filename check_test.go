@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/stats"
 )
 
 func TestQuoteIdent(t *testing.T) {
@@ -246,6 +250,44 @@ func TestIpcHeaderInfo(t *testing.T) {
 	}
 }
 
+func TestByteCounterBatchKinds(t *testing.T) {
+	// a dictionary-encoded column makes the writer emit schema + dictionary
+	// batch + record batch — the counter must tell the three apart
+	dt := &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: arrow.BinaryTypes.String}
+	schema := arrow.NewSchema([]arrow.Field{{Name: "s", Type: dt}}, nil)
+	rb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer rb.Release()
+	db := rb.Field(0).(*array.BinaryDictionaryBuilder)
+	for _, v := range []string{"a", "b", "a"} {
+		if err := db.AppendString(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := rb.NewRecord()
+	defer rec.Release()
+
+	buf := &bytes.Buffer{}
+	w := ipc.NewWriter(buf, ipc.WithSchema(schema))
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	bc := &byteCounter{}
+	for _, h := range ipcMessages(t, buf.Bytes()) {
+		bc.HandleRPC(context.Background(), &stats.InPayload{
+			Payload:    &flight.FlightData{DataHeader: h},
+			WireLength: len(h),
+		})
+	}
+	if bc.msgs.Load() != 3 {
+		t.Fatalf("messages seen: %d (want 3: schema, dictionary, batch)", bc.msgs.Load())
+	}
+	if r, d := bc.recBatches.Load(), bc.dictBatches.Load(); r != 1 || d != 1 {
+		t.Errorf("recBatches=%d dictBatches=%d (want 1/1)", r, d)
+	}
+}
+
 func TestReorderJSON(t *testing.T) {
 	rec := testRecord(t) // schema order: id, name
 	defer rec.Release()
@@ -256,5 +298,24 @@ func TestReorderJSON(t *testing.T) {
 	}
 	if got := reorderJSON("not json", rec.Schema()); got != "not json" {
 		t.Errorf("passthrough: %s", got)
+	}
+}
+
+func TestRowsEqual(t *testing.T) {
+	if !rowsEqual([]string{"42"}, []string{"42"}, false) {
+		t.Error("identical strings")
+	}
+	if rowsEqual([]string{"42"}, []string{"43"}, false) {
+		t.Error("different strings accepted")
+	}
+	// float-summation noise inside the relative tolerance is NOT drift
+	if !rowsEqual([]string{"40.51837000000001"}, []string{"40.51837"}, true) {
+		t.Error("float noise flagged as drift")
+	}
+	if rowsEqual([]string{"40.5184"}, []string{"40.5183"}, true) {
+		t.Error("real numeric drift accepted")
+	}
+	if rowsEqual([]string{"1", "2"}, []string{"1"}, false) {
+		t.Error("length mismatch accepted")
 	}
 }

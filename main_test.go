@@ -85,17 +85,17 @@ func TestResolveSink(t *testing.T) {
 
 func TestAutoMaxRows(t *testing.T) {
 	cases := []struct {
-		flag        int
-		format      string
-		toFile      bool
-		want        int
+		flag   int
+		format string
+		toFile bool
+		want   int
 	}{
 		{-1, "table", false, 40},
 		{-1, "md", false, 1000},
-		{-1, "md", true, 0},     // explicit file sink: never capped
+		{-1, "md", true, 0}, // explicit file sink: never capped
 		{-1, "csv", false, 0},
 		{-1, "arrow", false, 0},
-		{5, "md", false, 5},     // explicit flag always wins
+		{5, "md", false, 5}, // explicit flag always wins
 		{5, "csv", true, 5},
 		{0, "md", false, 0},
 	}
@@ -202,7 +202,7 @@ func TestMdEscape(t *testing.T) {
 
 func TestConnHint(t *testing.T) {
 	cases := map[string]string{
-		"remote error: tls: certificate required": "client certificate",
+		"remote error: tls: certificate required":       "client certificate",
 		"x509: certificate signed by unknown authority": "isn't signed by a CA",
 		"context deadline exceeded":                     "RPC hangs",
 		"some other error":                              "",
@@ -425,5 +425,65 @@ func TestErrorClassification(t *testing.T) {
 	}
 	if errors.As(usagef("x"), &ce) {
 		t.Error("usageError classified as connError")
+	}
+}
+
+func TestSpark(t *testing.T) {
+	vals := make([]float64, 100)
+	for i := range vals {
+		vals[i] = float64(i)
+	}
+	s := []rune(spark(vals, 50))
+	if len(s) != 50 || s[0] != '▁' || s[49] != '█' {
+		t.Errorf("ramp: %s", string(s))
+	}
+	if flat := spark([]float64{5, 5, 5, 5, 5, 5, 5, 5}, 50); flat != strings.Repeat("▄", 8) {
+		t.Errorf("flat (short input → own length): %s", flat)
+	}
+}
+
+func TestRecordWriterSampling(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "v", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "s", Type: arrow.BinaryTypes.String},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	vb := b.Field(0).(*array.Int64Builder)
+	sb := b.Field(1).(*array.StringBuilder)
+	for i := 0; i < 10; i++ {
+		if i == 3 {
+			vb.AppendNull()
+		} else {
+			vb.Append(int64(i))
+		}
+		sb.Append("x")
+	}
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	rw := &recordWriter{sparkCols: []int{0}, samples: make([][]float64, 1), schema: schema}
+	rw.sample(rec)
+	if len(rw.samples[0]) != 9 { // the null row is skipped
+		t.Errorf("samples: %d", len(rw.samples[0]))
+	}
+	if rw.sparkDone { // cap not reached yet
+		t.Error("sparkDone set before cap")
+	}
+}
+
+func TestCompletionTables(t *testing.T) {
+	cmds := completionCommands()
+	if len(cmds) < 13 {
+		t.Errorf("commands: %v", cmds)
+	}
+	sql := strings.Join(flagsFor("sql"), " ")
+	for _, want := range []string{"--s", "--stats", "--ipc", "--tls-ca"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("sql flags missing %s: %s", want, sql)
+		}
+	}
+	if fb := strings.Join(flagsFor("feedback"), " "); strings.Contains(fb, "--tls-ca") {
+		t.Errorf("feedback must not take connection flags: %s", fb)
 	}
 }
