@@ -2458,6 +2458,7 @@ usage:
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
+  sparrow doctor --server                         conformance card: which Flight SQL surfaces work
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow diff <table> --against <profile|uri>    drift gate: schema·count·bounds vs a second server
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
@@ -2468,8 +2469,9 @@ usage:
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
   data.parquet · data.csv · data.json · data.jsonl · data.arrow · data.md
-Defaults: a TTY gets a table; a pipe streams raw Arrow IPC (composable with
-DuckDB, Python, anything). Agents and scripts: use -o md, -o jsonl or -o csv.
+Defaults: a TTY gets a table (numeric columns add a whole-stream sparkline);
+a pipe streams raw Arrow IPC (composable with DuckDB, Python, anything).
+Agents and scripts: use -o md, -o jsonl or -o csv.
 Security: --tls-ca / --tls-cert / --tls-key for private CAs and mTLS;
   sql --encrypt-key <hex|env:VAR|file:path> seals parquet output (in-spec
   Parquet Modular Encryption — DuckDB/Spark/pyarrow read it back with the key).
