@@ -48,7 +48,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.11.0-dev"
+var version = "0.12.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -1256,17 +1256,32 @@ func cmdSQL(args []string) error {
 run a Flight SQL statement; -o picks the output format or file
 examples: sparrow sql "SELECT 42 AS x" -o md
           sparrow sql "SELECT * FROM t" -o data.parquet
-          sparrow sql "SELECT * FROM t" | duckdb   (pipe = raw Arrow IPC)`)
+          sparrow sql "SELECT * FROM t" | duckdb   (pipe = raw Arrow IPC)
+          sparrow sql --substrait plan.pb          (execute a Substrait plan)`)
 	cf := addConnFlags(fs)
 	maxRows := fs.Int("max-rows", -1, "max rows to emit (default: 40 table, 1000 md, unlimited otherwise)")
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	file := fs.String("f", "", "read the SQL from a file")
+	substrait := fs.String("substrait", "", "execute a serialized Substrait plan from this file instead of SQL (sparrow stays a client, not a planner)")
 	encKey := fs.String("encrypt-key", "", "encrypt parquet output (Parquet Modular Encryption): hex, env:VAR or file:path")
 	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr: plan / first byte / stream, rows, wire bytes, throughput")
 	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr: message type, rows, body bytes, codec, custom metadata")
 	pos := parseFlags(fs, args)
 	var query string
+	var plan []byte
 	switch {
+	case *substrait != "":
+		if len(pos) > 0 || *file != "" {
+			return usagef("--substrait replaces the SQL text — drop the query argument / -f")
+		}
+		b, err := os.ReadFile(*substrait)
+		if err != nil {
+			return err
+		}
+		if len(b) == 0 {
+			return usagef("%s is empty — expected a serialized Substrait plan", *substrait)
+		}
+		plan = b
 	case *file != "":
 		b, err := os.ReadFile(*file)
 		if err != nil {
@@ -1286,12 +1301,14 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		return usagef(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
-	return execStatement(cf, query, *output, *encKey, *maxRows, *statsOn, *ipcOn)
+	return execStatement(cf, query, plan, *output, *encKey, *maxRows, *statsOn, *ipcOn)
 }
 
 // execStatement is the shared execution core behind sql and query:
-// dial, run, sink, and the optional --stats / --ipc reports.
-func execStatement(cf *connFlags, query, output, encKey string, maxRows int, statsOn, ipcOn bool) error {
+// dial, run, sink, and the optional --stats / --ipc reports. A non-nil
+// plan executes as a Substrait plan (CommandStatementSubstraitPlan)
+// instead of SQL text — gated on the server's advertised capability.
+func execStatement(cf *connFlags, query string, plan []byte, output, encKey string, maxRows int, statsOn, ipcOn bool) error {
 	p, _, err := cf.resolve()
 	if err != nil {
 		return err
@@ -1313,8 +1330,24 @@ func execStatement(cf *connFlags, query, output, encKey string, maxRows int, sta
 	}
 	defer cl.Close()
 
-	t0 := time.Now()
-	info, err := cl.Execute(ctx, query)
+	var info *flight.FlightInfo
+	var t0 time.Time
+	if plan != nil {
+		// the tester's spec: pre-check SqlInfo code 5 and fail with a clear
+		// message instead of firing the plan into a raw Unimplemented
+		switch substraitAdvertised(ctx, cl) {
+		case "false":
+			return fmt.Errorf("server advertises Substrait=False (GetSqlInfo code 5) — it will not accept a plan; run: sparrow doctor --server")
+		case "true":
+		default:
+			fmt.Fprintln(os.Stderr, "note: server does not advertise Substrait support (GetSqlInfo code 5 absent) — attempting anyway")
+		}
+		t0 = time.Now()
+		info, err = cl.ExecuteSubstrait(ctx, flightsql.SubstraitPlan{Plan: plan})
+	} else {
+		t0 = time.Now()
+		info, err = cl.Execute(ctx, query)
+	}
 	if err != nil {
 		return err
 	}
@@ -2456,6 +2489,7 @@ usage:
   sparrow info <table> [-s profile] [--no-count]
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats] [--ipc]
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
+  sparrow sql --substrait plan.pb                 execute a serialized Substrait plan
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work

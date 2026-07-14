@@ -367,6 +367,21 @@ func fetchSqlInfo(ctx context.Context, cl *flightsql.Client) ([]sqlInfoEntry, er
 	return out, nil
 }
 
+// substraitAdvertised reads the server's Substrait capability flag
+// (SqlInfo code 5): "true", "false", or "" when absent/unanswerable.
+func substraitAdvertised(ctx context.Context, cl *flightsql.Client) string {
+	entries, err := fetchSqlInfo(ctx, cl)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.code == 5 {
+			return e.value
+		}
+	}
+	return ""
+}
+
 // sqlInfoFlags — the capability booleans/enums a client actually plans around.
 var sqlInfoFlags = []struct {
 	code uint32

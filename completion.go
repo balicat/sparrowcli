@@ -41,7 +41,7 @@ var cmdOwnFlags = map[string][]string{
 	"orient":     nil,
 	"ls":         {"o"},
 	"info":       {"no-count"},
-	"sql":        {"f", "o", "max-rows", "encrypt-key", "stats", "ipc"},
+	"sql":        {"f", "substrait", "o", "max-rows", "encrypt-key", "stats", "ipc"},
 	"query":      {"cols", "where", "order", "desc", "limit", "o", "max-rows", "encrypt-key", "stats", "ipc"},
 	"doctor":     {"o", "server"},
 	"check":      {"key", "time", "value", "max-age", "strict", "o"},

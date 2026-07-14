@@ -59,5 +59,5 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	if stdoutIsTTY() {
 		fmt.Fprintln(os.Stderr, "sql: "+q)
 	}
-	return execStatement(cf, q, *output, *encKey, *maxRows, *statsOn, *ipcOn)
+	return execStatement(cf, q, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn)
 }

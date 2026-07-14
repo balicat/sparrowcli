@@ -32,7 +32,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
 | `sparrow ls [pattern]` | list tables (pattern semantics are the server's: SQL `LIKE` on most) | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
-| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan instead of SQL) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) instead) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers (`--strict` fails on warnings) | server-side SQL aggregates — the table is never downloaded |

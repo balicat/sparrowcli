@@ -70,6 +70,15 @@ has query-rows "999"
 [ "$(grep -c '^99' "$OUT")" = 3 ] || { echo "FAIL query-limit: $(cat "$OUT")"; fails=$((fails + 1)); }
 t query-usage 3 "$BIN" query
 
+# ── substrait: the guard path (fixture advertises Substrait=False, so the
+#    pre-check must refuse with a clear message BEFORE sending the plan) ──
+PLAN=$(mktemp)
+printf 'not-a-real-plan' >"$PLAN"
+t substrait-guard 1 "$BIN" sql --substrait "$PLAN" -o csv
+has substrait-msg "advertises Substrait=False" "$ERR"
+t substrait-usage 3 "$BIN" sql --substrait "$PLAN" "SELECT 1"
+rm -f "$PLAN"
+
 t sql-stats 0 "$BIN" sql "SELECT r FROM range(5000) t(r)" -o csv --stats
 has stats-block "query stats" "$ERR"
 has stats-batches "rows/batch" "$ERR"
