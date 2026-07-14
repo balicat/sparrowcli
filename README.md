@@ -33,10 +33,13 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow ls [pattern]` | list tables (pattern semantics are the server's: SQL `LIKE` on most) | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
-| `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
+| `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
+| `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) instead) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers (`--strict` fails on warnings) | server-side SQL aggregates — the table is never downloaded |
+| `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
 | `sparrow feedback "msg"` | send feedback to the sparrow maintainers | HTTPS to sparrowflight.io — independent of whichever server you use |
+| `sparrow completion bash\|zsh\|fish` | shell tab-completion script | — |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth — the two adapters that cover the whole tested landscape:

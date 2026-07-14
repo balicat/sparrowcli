@@ -24,21 +24,32 @@ jobs:
         with:
           go-version: "1.25"
       - run: go build -o sparrow .
-      - name: start gizmosql fixture
+      - name: start gizmosql fixtures (primary + drift replica)
         run: |
           docker run -d --name gizmosql -p 31337:31337 \
             -e TLS_ENABLED=1 \
             -e GIZMOSQL_USERNAME=gizmosql_username \
             -e GIZMOSQL_PASSWORD=gizmosql_password \
             gizmodata/gizmosql:latest
-          for i in $(seq 1 60); do
-            ./sparrow sql "SELECT 1" -s grpc+tls://localhost:31337 \
-              --basic gizmosql_username:gizmosql_password --tls-skip-verify \
-              -o csv >/dev/null 2>&1 && exit 0
-            sleep 2
+          docker run -d --name gizmosql2 -p 31338:31337 \
+            -e TLS_ENABLED=1 \
+            -e GIZMOSQL_USERNAME=gizmosql_username \
+            -e GIZMOSQL_PASSWORD=gizmosql_password \
+            gizmodata/gizmosql:latest
+          for port in 31337 31338; do
+            ok=0
+            for i in $(seq 1 60); do
+              ./sparrow sql "SELECT 1" -s grpc+tls://localhost:$port \
+                --basic gizmosql_username:gizmosql_password --tls-skip-verify \
+                -o csv >/dev/null 2>&1 && { ok=1; break; }
+              sleep 2
+            done
+            if [ "$ok" != 1 ]; then
+              echo "gizmosql on :$port did not become ready"
+              docker logs gizmosql 2>&1 | tail -20
+              docker logs gizmosql2 2>&1 | tail -20
+              exit 1
+            fi
           done
-          echo "gizmosql did not become ready"
-          docker logs gizmosql | tail -30
-          exit 1
       - run: pip install pyarrow
-      - run: bash test/smoke.sh
+      - run: URI2=grpc+tls://localhost:31338 bash test/smoke.sh

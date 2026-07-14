@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,5 +318,57 @@ func TestRowsEqual(t *testing.T) {
 	}
 	if rowsEqual([]string{"1", "2"}, []string{"1"}, false) {
 		t.Error("length mismatch accepted")
+	}
+}
+
+func TestLintSqlInfo(t *testing.T) {
+	// the shape the tester found on the pre-fix demo server: 5 string-typed
+	// entries, timeouts carrying strings, one non-standard code
+	sparse := []sqlInfoEntry{
+		{0, "string_value", "EnergyScope"},
+		{1, "string_value", "1.0"},
+		{100, "string_value", "EnergyScope Flight SQL"},
+		{101, "string_value", `"`},
+		{102, "string_value", "DuckDB"},
+	}
+	caps, lint := lintSqlInfo(sparse)
+	if caps != "" {
+		t.Errorf("sparse block produced caps: %q", caps)
+	}
+	if len(lint) != 4 { // no-flags + 100 + 101 + non-standard 102
+		t.Errorf("lint lines: %d %v", len(lint), lint)
+	}
+
+	// a healthy block: flags present, timeouts typed right
+	healthy := []sqlInfoEntry{
+		{0, "string_value", "gizmosql"},
+		{3, "bool_value", "false"},
+		{4, "bool_value", "true"},
+		{5, "bool_value", "false"},
+		{8, "int32_bitmask", "1"},
+		{9, "bool_value", "true"},
+		{100, "int32_bitmask", "0"},
+	}
+	caps, lint = lintSqlInfo(healthy)
+	if len(lint) != 0 {
+		t.Errorf("healthy block linted: %v", lint)
+	}
+	for _, want := range []string{"SQL ✓", "Substrait ✗", "txns ✓", "cancel ✓", "read-only ✗"} {
+		if !strings.Contains(caps, want) {
+			t.Errorf("caps missing %q: %s", want, caps)
+		}
+	}
+}
+
+func TestStandardSqlInfoCode(t *testing.T) {
+	for _, c := range []uint32{0, 5, 11, 100, 101, 504, 582} {
+		if !standardSqlInfoCode(c) {
+			t.Errorf("code %d should be standard", c)
+		}
+	}
+	for _, c := range []uint32{12, 99, 102, 499, 583} {
+		if standardSqlInfoCode(c) {
+			t.Errorf("code %d should be non-standard", c)
+		}
 	}
 }
