@@ -140,8 +140,11 @@ func TestFmtBytes(t *testing.T) {
 	if got := fmtBytes(22_500_000); got != "22.5 MB" {
 		t.Errorf("MB: %q", got)
 	}
-	if got := fmtBytes(4_200); got != "4 KB" {
+	if got := fmtBytes(4_200); got != "4.2 KB" {
 		t.Errorf("KB: %q", got)
+	}
+	if got := fmtBytes(512); got != "512 B" {
+		t.Errorf("B: %q", got)
 	}
 }
 
@@ -240,5 +243,18 @@ func TestIpcHeaderInfo(t *testing.T) {
 	m1, ok := ipcHeaderInfo(msgs[1])
 	if !ok || m1.Typ != "record batch" || m1.Rows != 3 || m1.Codec != "lz4_frame" || m1.Body <= 0 {
 		t.Errorf("batch message: %+v ok=%v", m1, ok)
+	}
+}
+
+func TestReorderJSON(t *testing.T) {
+	rec := testRecord(t) // schema order: id, name
+	defer rec.Release()
+	in := `{"name":"a","id":9223372036854775807}`
+	want := `{"id":9223372036854775807,"name":"a"}`
+	if got := reorderJSON(in, rec.Schema()); got != want {
+		t.Errorf("reorder: %s", got)
+	}
+	if got := reorderJSON("not json", rec.Schema()); got != "not json" {
+		t.Errorf("passthrough: %s", got)
 	}
 }

@@ -30,13 +30,13 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 |---|---|---|
 | `sparrow connect <uri>` | verify + save a profile | vendor probe via `GetSqlInfo`, `SELECT 1` fallback |
 | `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
-| `sparrow ls [pattern]` | list tables | `GetTables` — the one discovery RPC that works everywhere |
+| `sparrow ls [pattern]` | list tables (pattern semantics are the server's: SQL `LIKE` on most) | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
-| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers | server-side SQL aggregates — the table is never downloaded |
+| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers (`--strict` fails on warnings) | server-side SQL aggregates — the table is never downloaded |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
-| `sparrow feedback "msg"` | send feedback to the server's maintainer | the `feedback` DoAction — the public endpoint accepts it |
+| `sparrow feedback "msg"` | send feedback to the sparrow maintainers | HTTPS to sparrowflight.io — independent of whichever server you use |
 | `sparrow profiles` | list saved connections (`use <name>` / `rm <name>`) | — |
 
 Auth — the two adapters that cover the whole tested landscape:
@@ -63,6 +63,10 @@ sparrow sql "..." -o json            # JSON array
 sparrow sql "..." -o data.parquet    # file sink: .parquet .csv .json .jsonl .arrow .md
 ```
 
+JSON note: 64-bit integers are emitted as JSON numbers at full precision.
+JavaScript's `JSON.parse` silently loses precision above 2^53 — use a
+bigint-aware parser, or cast to text in SQL.
+
 **In a pipe, the default is a raw Arrow IPC stream** — columnar data stays
 columnar all the way:
 
@@ -86,8 +90,21 @@ sparrow sql "SELECT ..." -o data.parquet --encrypt-key env:SPARROW_KEY
 
 The encryption key is hex (16/24/32 bytes), `env:VAR`, or `file:path`.
 DuckDB, Spark and pyarrow read the file back with the key — and refuse it
-without. Verified against an Envoy that requires client certificates: no
-cert → refused (exit 2); cert → query runs.
+without. The exact DuckDB recipe (key handed over as **base64** of the same
+bytes):
+
+```sql
+PRAGMA add_parquet_key('k', '<base64 of the key bytes>');
+SELECT * FROM read_parquet('data.parquet', encryption_config = {footer_key: 'k'});
+```
+
+**Prefer 32-byte keys (64 hex digits).** DuckDB guesses whether the key
+string is raw bytes or base64 *by its length* — and base64 of a 16/24-byte
+key is exactly 24/32 characters, a valid raw-key length that DuckDB tries
+first, ending in a spurious "AES tag differs" error. A 32-byte key encodes
+to 44 characters and is unambiguous. (Found by an external tester driving
+this CLI — thanks.) mTLS verified against an Envoy that requires client
+certificates: no cert → refused (exit 2); cert → query runs.
 
 ## Doctor — when the connection doesn't work
 
@@ -201,7 +218,9 @@ $ sparrow check checkme --key k --max-age 7d
 `--key` names the entity key (uniqueness is checked on *(key, time)* when
 `--time` is set, and temporal columns are auto-detected). Duplicate keys and
 NULLs in key columns are failures and exit `1` — `sparrow check t --key id &&
-deploy` works as a data gate in CI. Staleness, frozen series (a constant
+deploy` works as a data gate in CI (`--strict` widens the gate to warnings,
+and a sub-check the server couldn't execute is an `!` error, never a silent
+pass). Staleness, frozen series (a constant
 value across ≥10 observations — a stuck feed's signature), dead columns and
 σ-outliers are warnings. `-o json` for pipelines and agents.
 
@@ -252,8 +271,9 @@ Conventions agents can rely on:
   (schema / dictionary / record batch), rows, body bytes, declared codec and
   custom-metadata count — wire-level introspection without a packet capture.
 - **Found a bug or have an idea? `sparrow feedback "..." --from your-name`**
-  delivers it to the server's maintainer over Flight itself (a `feedback`
-  DoAction). Agents are explicitly welcome to use it.
+  delivers it to the sparrow maintainers directly — independent of whichever
+  Flight server you're connected to, so it works even when the server is the
+  problem. Agents are explicitly welcome to use it.
 - `-o md` **to stdout** caps at 1,000 rows by default so a careless `SELECT *`
   can't flood a context window (the true total reports on stderr; `--max-rows`
   overrides). File sinks and data formats (csv/jsonl/json/arrow/parquet)

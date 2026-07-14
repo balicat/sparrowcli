@@ -1,30 +1,30 @@
-// feedback — send a message to the server's maintainer over Flight itself.
-// The server must implement the "feedback" DoAction (the public
-// sparrowflight.io endpoint does: it appends to a JSONL log and notifies
-// the maintainer). Built so AI agents driving this CLI have a way to file
-// what they hit: `sparrow feedback "orient chokes on catalog X" --category bug`.
+// feedback — send a message to the sparrow maintainers. Deliberately
+// INDEPENDENT of whatever Flight server you're connected to: it POSTs to
+// the fixed receiver at sparrowflight.io, so it works from any server,
+// or with no working server at all — which is exactly when you need it.
+// Built so AI agents driving this CLI have a way to file what they hit:
+// `sparrow feedback "orient chokes on catalog X" --category bug --from claude`.
 package main
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/apache/arrow-go/v18/arrow/flight"
 )
+
+const feedbackURL = "https://sparrowflight.io/api/feedback"
 
 func cmdFeedback(args []string) error {
 	fs := newFlagSet("feedback", `usage: sparrow feedback "your message" [flags]
-send feedback to the connected server's maintainer (a Flight "feedback"
-DoAction — the public sparrowflight.io endpoint accepts it)
+send feedback to the sparrow maintainers — goes to sparrowflight.io directly,
+independent of whichever Flight server you use (SPARROW_FEEDBACK_URL overrides)
 examples: sparrow feedback "orient saved my day"
           sparrow feedback "check false-positives on X" --category bug --from claude`)
-	cf := addConnFlags(fs)
 	category := fs.String("category", "general", "bug | idea | general")
 	from := fs.String("from", "", "who this is from (default: $SPARROW_USER, else anonymous)")
 	pos := parseFlags(fs, args)
@@ -39,46 +39,40 @@ examples: sparrow feedback "orient saved my day"
 	if user == "" {
 		user = "anonymous"
 	}
+	url := os.Getenv("SPARROW_FEEDBACK_URL")
+	if url == "" {
+		url = feedbackURL
+	}
 
-	p, _, err := cf.resolve()
-	if err != nil {
-		return err
+	// which server the user works against is useful context for a report —
+	// config only, no credentials, no dialing
+	server := ""
+	cfg := loadConfig()
+	if p, ok := cfg.Profiles[cfg.Default]; ok {
+		server = p.URI
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cl, ctx, err := dial(ctx, p)
-	if err != nil {
-		return err
-	}
-	defer cl.Close()
 
 	body, _ := json.Marshal(map[string]string{
 		"message":        msg,
 		"category":       *category,
 		"user":           user,
 		"client_version": "sparrowcli/" + versionString() + " " + runtime.GOOS + "/" + runtime.GOARCH,
+		"server":         server,
 	})
-	stream, err := cl.Client.DoAction(ctx, &flight.Action{Type: "feedback", Body: body})
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("this server doesn't accept feedback: %w", err)
+		return connError{fmt.Errorf("could not reach the feedback receiver: %w", err)}
 	}
-	res, err := stream.Recv()
-	if err != nil && err != io.EOF {
-		return fmt.Errorf("this server doesn't accept feedback: %w", err)
+	defer resp.Body.Close()
+	var ack struct {
+		OK bool   `json:"ok"`
+		TS string `json:"ts"`
 	}
-	for err == nil { // drain
-		_, err = stream.Recv()
+	_ = json.NewDecoder(resp.Body).Decode(&ack)
+	if resp.StatusCode != 200 || !ack.OK {
+		return connError{fmt.Errorf("feedback receiver answered %s", resp.Status)}
 	}
-	if res != nil && len(res.Body) > 0 {
-		var ack struct {
-			OK bool   `json:"ok"`
-			TS string `json:"ts"`
-		}
-		if json.Unmarshal(res.Body, &ack) == nil && ack.OK {
-			fmt.Printf("✓ feedback delivered (%s) — thank you\n", ack.TS)
-			return nil
-		}
-	}
-	fmt.Println("✓ feedback sent")
+	fmt.Printf("✓ feedback delivered (%s) — thank you\n", ack.TS)
 	return nil
 }

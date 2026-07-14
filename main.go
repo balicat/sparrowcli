@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -46,7 +47,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.9.1-dev"
+var version = "0.10.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -196,7 +197,11 @@ func dial(ctx context.Context, p Profile, extra ...grpc.DialOption) (*flightsql.
 		authCtx, err := cl.Client.AuthenticateBasicToken(ctx, p.User, p.Pass)
 		if err != nil {
 			cl.Close()
-			return nil, ctx, connError{fmt.Errorf("auth failed: %w", err)}
+			label := "connection failed during the auth handshake"
+			if st, ok := status.FromError(err); ok && st.Code() == codes.Unauthenticated {
+				label = "auth failed"
+			}
+			return nil, ctx, connError{fmt.Errorf("%s: %w", label, err)}
 		}
 		return cl, authCtx, nil
 	case "bearer":
@@ -395,6 +400,40 @@ func resolveSink(o string) (sink, error) {
 	return sink{format: format, w: f, closer: f, path: o}, nil
 }
 
+// reorderJSON rewrites one RecordToJSON row so keys follow the schema's
+// column order instead of Go's alphabetical map order — values are kept as
+// raw bytes, so int64 precision survives untouched.
+func reorderJSON(line string, schema *arrow.Schema) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(line), &m) != nil {
+		return line
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	first := true
+	emitKV := func(k string, v json.RawMessage) {
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		nb, _ := json.Marshal(k)
+		b.Write(nb)
+		b.WriteByte(':')
+		b.Write(v)
+	}
+	for _, f := range schema.Fields() {
+		if v, ok := m[f.Name]; ok {
+			emitKV(f.Name, v)
+			delete(m, f.Name)
+		}
+	}
+	for k, v := range m { // leftovers, defensively
+		emitKV(k, v)
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
 func mdEscape(vals []string) []string {
 	out := make([]string, len(vals))
 	for i, v := range vals {
@@ -507,6 +546,7 @@ func (rw *recordWriter) write(rec arrow.Record) error {
 			if ln == "" {
 				continue
 			}
+			ln = reorderJSON(ln, rw.schema)
 			if rw.s.format == "jsonl" {
 				fmt.Fprintln(rw.s.w, ln)
 			} else {
@@ -618,7 +658,10 @@ func fmtBytes(n int64) string {
 	if n >= 1e6 {
 		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
 	}
-	return fmt.Sprintf("%.0f KB", float64(n)/1e3)
+	if n >= 1e3 {
+		return fmt.Sprintf("%.1f KB", float64(n)/1e3)
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 func (st *qstats) observe(rec arrow.Record, tStream time.Time) {
@@ -1031,7 +1074,8 @@ example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:dem
 
 func cmdLs(args []string) error {
 	fs := newFlagSet("ls", `usage: sparrow ls [pattern] [flags]
-list tables via the GetTables RPC (works identically on every Flight SQL server)
+list tables via GetTables; pattern semantics are the SERVER's (SQL LIKE
+with % and _ on most; the demo server matches substrings, case-sensitive)
 example: sparrow ls -o md`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
@@ -1145,6 +1189,10 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		if err != nil {
 			return err
 		}
+		if len(k) != 32 {
+			fmt.Fprintln(os.Stderr, "note: prefer 32-byte keys for DuckDB read-back — base64 of a"+
+				" 16/24-byte key is 24/32 chars, which DuckDB misreads as a raw key")
+		}
 		s.encKey = k
 	}
 	var st *qstats
@@ -1180,7 +1228,7 @@ total                 %6d ms
 		fmt.Fprintln(os.Stderr, rowsLine)
 
 		wireLine := fmt.Sprintf("wire       %s received", fmtBytes(wire))
-		if st.decoded > 0 && wire > 0 {
+		if st.decoded > 0 && wire >= 2048 { // ratios on tiny payloads are noise
 			wireLine += fmt.Sprintf(" · decodes to %s (%.1f×)", fmtBytes(st.decoded),
 				float64(st.decoded)/float64(wire))
 		}
@@ -1192,7 +1240,9 @@ total                 %6d ms
 			}
 		}
 		fmt.Fprintln(os.Stderr, wireLine)
-		fmt.Fprintf(os.Stderr, "speed      %.0f Mbit/s over the stream\n", mbit)
+		if wire >= 100_000 {
+			fmt.Fprintf(os.Stderr, "speed      %.0f Mbit/s over the stream\n", mbit)
+		}
 
 		// pacing: waits exclude local sink-write time, so the gaps are the
 		// sender + network, not us
@@ -1663,13 +1713,13 @@ type doctorReport struct {
 }
 
 type doctor struct {
-	rep               doctorReport
-	json              bool
-	oks, warns, fails int
-	firstFail         string
+	rep                     doctorReport
+	json                    bool
+	oks, warns, fails, errs int
+	firstFail               string
 }
 
-var statusMark = map[string]string{"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
+var statusMark = map[string]string{"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·", "error": "!"}
 
 func (d *doctor) emit(r checkResult) {
 	d.rep.Checks = append(d.rep.Checks, r)
@@ -1683,6 +1733,8 @@ func (d *doctor) emit(r checkResult) {
 		if d.firstFail == "" {
 			d.firstFail = r.Check
 		}
+	case "error":
+		d.errs++
 	}
 	if d.json {
 		return
@@ -2213,6 +2265,10 @@ examples: sparrow ping · sparrow ping -n 20 -s gizmo · sparrow ping -o json`)
 	return nil
 }
 
+// grpcDetailRe strips the redundant ". Detail: Failed" tail that gRPC status
+// strings carry into otherwise-clean server error messages.
+var grpcDetailRe = regexp.MustCompile(`[.\s]*Detail:\s*[A-Za-z]+\s*$`)
+
 func usage() {
 	fmt.Println(`sparrow ` + versionString() + ` — Arrow Flight data. At the speed of the command line.
 
@@ -2226,7 +2282,7 @@ usage:
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
-  sparrow feedback "message" [--category bug]     send feedback to the server's maintainer
+  sparrow feedback "message" [--category bug]     send feedback to the sparrow maintainers
   sparrow profiles [use <name> | rm <name>]
   sparrow version
 
@@ -2302,11 +2358,12 @@ func main() {
 		}
 		usage()
 	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
 		os.Exit(3)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, "error:", grpcDetailRe.ReplaceAllString(err.Error(), ""))
 		// connection/auth/profile failures exit 2, query errors exit 1 —
 		// gRPC dials lazily, so Unavailable/Unauthenticated surface at the
 		// first RPC and are classified here rather than at dial time

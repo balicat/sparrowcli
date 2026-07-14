@@ -174,6 +174,7 @@ examples: sparrow check series_data --key series_id --time period
 	timeF := fs.String("time", "", "time column — enables span + staleness; with --key, uniqueness is checked on (key, time)")
 	valueF := fs.String("value", "", "value column for the frozen-series check (default: the sole numeric column)")
 	maxAgeF := fs.String("max-age", "", `warn when the newest time point is older than this ("7d", "48h")`)
+	strict := fs.Bool("strict", false, "treat warnings as failures (exit 1) — for CI gates")
 	output := fs.String("o", "", `output: "json" for a machine-readable report`)
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
@@ -215,17 +216,27 @@ examples: sparrow check series_data --key series_id --time period
 	row1 := func(sql string) ([]string, error) { nq++; return queryRow(ctx, cl, sql) }
 
 	finish := func() error {
-		d.rep.OK = d.fails == 0
+		d.rep.OK = d.fails == 0 && d.errs == 0
 		if d.json {
 			b, _ := json.MarshalIndent(d.rep, "", "  ")
 			fmt.Println(string(b))
 		} else {
 			fmt.Println()
-			fmt.Printf("%d ok · %d warn · %d fail — checked in %.1f s (%d queries, server-side)\n",
-				d.oks, d.warns, d.fails, time.Since(t0).Seconds(), nq)
+			line := fmt.Sprintf("%d ok · %d warn · %d fail", d.oks, d.warns, d.fails)
+			if d.errs > 0 {
+				line += fmt.Sprintf(" · %d error", d.errs)
+			}
+			fmt.Printf("%s — checked in %.1f s (%d queries, server-side)\n",
+				line, time.Since(t0).Seconds(), nq)
 		}
 		if d.fails > 0 {
 			return fmt.Errorf("check: %d finding(s) — see the ✗ lines", d.fails)
+		}
+		if d.errs > 0 {
+			return fmt.Errorf("check: %d check(s) could not run — see the ! lines", d.errs)
+		}
+		if *strict && d.warns > 0 {
+			return fmt.Errorf("check: %d warning(s) under --strict", d.warns)
 		}
 		return nil
 	}
@@ -299,7 +310,7 @@ examples: sparrow check series_data --key series_id --time period
 	// ── rows ──────────────────────────────────────────────────────────────
 	var totalRows int64 = -1
 	if row, err := row1("SELECT COUNT(*) FROM " + texpr); err != nil {
-		d.emit(checkResult{Check: "rows", Status: "skip", Detail: firstLine(err)})
+		d.emit(checkResult{Check: "rows", Status: "error", Detail: firstLine(err)})
 	} else if row != nil {
 		totalRows, _ = strconv.ParseInt(row[0], 10, 64)
 		st := "ok"
@@ -322,7 +333,7 @@ examples: sparrow check series_data --key series_id --time period
 		sel += ", COUNT(" + quoteIdent(f.Name) + ")"
 	}
 	if row, err := row1(sel + " FROM " + texpr); err != nil {
-		d.emit(checkResult{Check: "nulls", Status: "skip", Detail: firstLine(err)})
+		d.emit(checkResult{Check: "nulls", Status: "error", Detail: firstLine(err)})
 	} else if row != nil {
 		total, _ := strconv.ParseFloat(row[0], 64)
 		st, parts, lines := "ok", []string{}, []string{}
@@ -374,7 +385,7 @@ examples: sparrow check series_data --key series_id --time period
 		gb := strings.Join(qcols, ", ")
 		if row, err := row1("SELECT COUNT(*) FROM (SELECT " + gb + " FROM " + texpr +
 			" GROUP BY " + gb + " HAVING COUNT(*) > 1) AS d"); err != nil {
-			d.emit(checkResult{Check: "keys", Status: "skip", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "keys", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
 			n, _ := strconv.ParseInt(row[0], 10, 64)
 			if n == 0 {
@@ -403,11 +414,20 @@ examples: sparrow check series_data --key series_id --time period
 	} else {
 		qt := quoteIdent(timeCol)
 		if row, err := row1("SELECT MIN(" + qt + "), MAX(" + qt + ") FROM " + texpr); err != nil {
-			d.emit(checkResult{Check: "time", Status: "skip", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "time", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
-			detail := fmt.Sprintf("%s spans %s → %s", timeCol, row[0], row[1])
+			lo, hi := row[0], row[1]
 			st, hint := "ok", ""
-			if newest, ok := parseWhen(row[1]); ok {
+			if lo == "" {
+				lo = "(empty)"
+				st = "warn"
+				hint = "some " + timeCol + " values are empty strings"
+			}
+			if hi == "" {
+				hi = "(empty)"
+			}
+			detail := fmt.Sprintf("%s spans %s → %s", timeCol, lo, hi)
+			if newest, ok := parseWhen(hi); ok && row[1] != "" {
 				age := time.Since(newest)
 				detail += fmt.Sprintf(" · newest point %.1f days old", age.Hours()/24)
 				if maxAge > 0 && age > maxAge {
@@ -431,7 +451,7 @@ examples: sparrow check series_data --key series_id --time period
 		gb := strings.Join(qcols, ", ")
 		if row, err := row1("SELECT COUNT(*), MIN(c), AVG(c), MAX(c) FROM (SELECT COUNT(*) AS c FROM " +
 			texpr + " GROUP BY " + gb + ") AS s"); err != nil {
-			d.emit(checkResult{Check: "coverage", Status: "skip", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "coverage", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
 			avg, _ := strconv.ParseFloat(row[2], 64)
 			d.emit(checkResult{Check: "coverage", Status: "ok",
@@ -483,7 +503,7 @@ examples: sparrow check series_data --key series_id --time period
 		having := " HAVING COUNT(DISTINCT " + qv + ") = 1 AND COUNT(" + qv + ") >= 10"
 		if row, err := row1("SELECT COUNT(*) FROM (SELECT " + gb + " FROM " + texpr +
 			" GROUP BY " + gb + having + ") AS f"); err != nil {
-			d.emit(checkResult{Check: "frozen", Status: "skip", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "frozen", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
 			n, _ := strconv.ParseInt(row[0], 10, 64)
 			if n == 0 {
@@ -536,7 +556,7 @@ examples: sparrow check series_data --key series_id --time period
 			row, err = row1(sel + " FROM " + texpr)
 		}
 		if err != nil {
-			d.emit(checkResult{Check: "numeric", Status: "skip", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "numeric", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
 			st, lines := "ok", []string{}
 			var parts []string

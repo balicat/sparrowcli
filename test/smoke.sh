@@ -71,7 +71,30 @@ has stats-codec "no body compression declared" "$ERR"
 
 t sql-ipc 0 "$BIN" sql "SELECT r FROM range(5000) t(r)" -o csv --ipc
 has ipc-manifest "record batch" "$ERR"
-t feedback-unsupported 1 "$BIN" feedback "smoke test message"
+t feedback-usage 3 "$BIN" feedback
+if command -v python3 >/dev/null; then
+  python3 - >/dev/null 2>&1 <<'PYSTUB' &
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        req = json.loads(self.rfile.read(n))
+        body = json.dumps({'ok': bool(req.get('message')), 'ts': 'stub'}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+HTTPServer(('127.0.0.1', 31499), H).handle_request()
+PYSTUB
+  STUBPID=$!
+  sleep 1
+  SPARROW_FEEDBACK_URL=http://127.0.0.1:31499/feedback t feedback-stub 0 "$BIN" feedback "smoke delivery"
+  has feedback-ack "delivered"
+  wait $STUBPID 2>/dev/null
+fi
+SPARROW_FEEDBACK_URL=http://127.0.0.1:9/feedback t feedback-unreachable 2 "$BIN" feedback "x"
 
 # ── the md cap: stdout capped at 1000, explicit file sink gets everything ─
 t md-cap 0 "$BIN" sql "SELECT r FROM range(1500) t(r)" -o md
