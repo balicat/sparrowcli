@@ -83,6 +83,40 @@ production time (or produce against representative data) and the plan
 keeps its `namedTable` + `FilterRel`, which the server executes against
 the real data.
 
+## Producer compatibility (found the hard way, by an external tester)
+
+Substrait deprecated `FetchRel`'s integer `count`/`offset` fields in favor
+of `count_expr`/`offset_expr` (Expression). **DataFusion (Substrait ≥0.85)
+emits the new fields; DuckDB's consumer (0.78) reads only the deprecated
+ints** — so a DataFusion plan with a `LIMIT` used to execute as `LIMIT 0`
+and return a *silently empty* result. Credit: an external tester
+root-caused this by patching plan bytes to rule out version and
+`maintainSingularStruct`, isolating `FetchRel` as the sole cause.
+
+The sparrowflight.io server now **detects the encoding and fails loudly**
+instead:
+
+```
+error: Substrait plan encodes LIMIT/OFFSET as FetchRel count_expr/offset_expr
+(Substrait >= 0.8x, e.g. DataFusion); this server's consumer (DuckDB substrait,
+0.78) reads only the deprecated integer fields and would silently execute
+LIMIT 0. Re-produce the plan with a producer that emits the deprecated fetch
+fields (e.g. DuckDB get_substrait), or drop the LIMIT/OFFSET from the plan.
+```
+
+Practical producer matrix against a DuckDB-consuming server:
+
+| producer | plans without LIMIT | plans with LIMIT |
+|---|---|---|
+| DuckDB `get_substrait` (`enable_optimizer=false`) | ✓ | ✓ (deprecated int `count`) |
+| DataFusion / datafusion-python | ✓ (filters, projections work) | ✗ refused loudly (`count_expr`) |
+
+Known second gap: DataFusion `COUNT(*)` aggregate plans hit a DuckDB
+binder error (`SELECT list is empty after resolving * expressions`) — a
+separate aggregate-encoding difference, loud rather than silent, unfixed.
+The durable fix for both is upstream: DuckDB's consumer reading the
+non-deprecated fields.
+
 ## Server support
 
 Very few Flight SQL servers accept plans today — `doctor --server` across
