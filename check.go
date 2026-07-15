@@ -177,11 +177,25 @@ func queryRows(ctx context.Context, cl *flightsql.Client, sql string, limit int)
 }
 
 func firstLine(err error) string {
+	if err == nil {
+		return "no error detail"
+	}
 	s := err.Error()
 	if i := strings.IndexByte(s, '\n'); i > 0 {
 		s = s[:i]
 	}
-	return s
+	// same ". Detail: Failed" gRPC cruft strip the sql path does (v0.10.0 #7)
+	return grpcDetailRe.ReplaceAllString(s, "")
+}
+
+// approxKeyExpr builds the approx_count_distinct argument for a key set:
+// a single column goes in raw (matches `sparrow profile`'s estimate for the
+// same column); composite keys need the hash() to become one expression.
+func approxKeyExpr(qcols []string) string {
+	if len(qcols) == 1 {
+		return qcols[0]
+	}
+	return "hash(" + strings.Join(qcols, ", ") + ")"
 }
 
 func splitCols(s string) []string {
@@ -209,17 +223,20 @@ func statusRank(s string) int {
 
 // diffBaseline compares the current report against a prior `check -o json`
 // report and prints any regression (a check that got worse, or a new
-// worse-than-ok check). Returns the regression count.
-func diffBaseline(path string, cur doctorReport, jsonMode bool) int {
+// worse-than-ok check). Returns the regression count. An unreadable or
+// invalid baseline is an ERROR, not a shrug — returning 0 silently would
+// disarm the CI gate on a typo'd path (tester finding, 2026-07-15).
+func diffBaseline(path string, cur doctorReport, jsonMode bool) (int, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "baseline: cannot read "+path+": "+firstLine(err))
-		return 0
+		return 0, fmt.Errorf("baseline: cannot read %s: %s", path, firstLine(err))
 	}
 	var base doctorReport
 	if err := json.Unmarshal(b, &base); err != nil {
-		fmt.Fprintln(os.Stderr, "baseline: "+path+" is not a check -o json report: "+firstLine(err))
-		return 0
+		return 0, fmt.Errorf("baseline: %s is not a check -o json report: %s", path, firstLine(err))
+	}
+	if len(base.Checks) == 0 {
+		return 0, fmt.Errorf("baseline: %s has no checks — not a check -o json report?", path)
 	}
 	prior := map[string]string{}
 	for _, c := range base.Checks {
@@ -244,7 +261,7 @@ func diffBaseline(path string, cur doctorReport, jsonMode bool) int {
 			fmt.Println(" ✗ " + r)
 		}
 	}
-	return len(regressions)
+	return len(regressions), nil
 }
 
 func cmdCheck(args []string) error {
@@ -318,8 +335,14 @@ examples: sparrow check series_data --key series_id --time period
 	finish := func() error {
 		d.rep.OK = d.fails == 0 && d.errs == 0
 		regressions := 0
+		var baseErr error
 		if *baseline != "" {
-			regressions = diffBaseline(*baseline, d.rep, d.json)
+			regressions, baseErr = diffBaseline(*baseline, d.rep, d.json)
+			if baseErr != nil {
+				// say it even when a finding already decides the exit code —
+				// the user must know the regression gate did not run
+				fmt.Fprintln(os.Stderr, "⚠ "+baseErr.Error()+" — the regression gate did NOT run")
+			}
 		}
 		if d.json {
 			b, _ := json.MarshalIndent(d.rep, "", "  ")
@@ -339,6 +362,10 @@ examples: sparrow check series_data --key series_id --time period
 		if d.errs > 0 {
 			return fmt.Errorf("check: %d check(s) could not run — see the ! lines", d.errs)
 		}
+		if baseErr != nil {
+			// hard-fail: a gate that can't read its baseline must not pass
+			return fmt.Errorf("check: %s", baseErr)
+		}
 		if regressions > 0 {
 			return fmt.Errorf("check: %d regression(s) vs the baseline", regressions)
 		}
@@ -347,6 +374,10 @@ examples: sparrow check series_data --key series_id --time period
 		}
 		return nil
 	}
+
+	// connection context belongs in the report even when the table probe
+	// fails — we DID dial and run the probe server-side (tester finding)
+	d.rep.Endpoint, d.rep.Profile, d.rep.Table = p.URI, pname, table
 
 	// ── schema (LIMIT 0 probe — also proves the table is queryable) ───────
 	nq++
@@ -365,11 +396,10 @@ examples: sparrow check series_data --key series_id --time period
 	}
 	if err != nil || schema == nil {
 		d.emit(checkResult{Check: "table", Status: "fail",
-			Detail: fmt.Sprintf("%s is not queryable: %v", table, err),
+			Detail: table + " is not queryable: " + firstLine(err),
 			Hint:   "sparrow ls lists what the server exposes"})
 		return finish()
 	}
-	d.rep.Endpoint, d.rep.Profile, d.rep.Table = p.URI, pname, table
 	if !d.json {
 		fmt.Printf("sparrow check — %s (profile: %s)\n\n", table, pname)
 	}
@@ -515,8 +545,10 @@ examples: sparrow check series_data --key series_id --time period
 		if *approx {
 			// memory-safe: one pass, HyperLogLog — never materializes the keys.
 			// total > distinct ⇒ duplicates; the gap is an ESTIMATE (~2% error).
-			if row, err := row1("SELECT COUNT(*), approx_count_distinct(hash(" + gb +
-				")) FROM " + texpr); err != nil {
+			// single column goes in RAW so the estimate matches `sparrow profile`
+			// (hash() re-buckets the HLL and the two drifted ~21% apart — tester)
+			if row, err := row1("SELECT COUNT(*), approx_count_distinct(" + approxKeyExpr(qcols) +
+				") FROM " + texpr); err != nil {
 				d.emit(checkResult{Check: "keys", Status: "error", Detail: firstLine(err)})
 			} else if row != nil {
 				total, _ := strconv.ParseInt(row[0], 10, 64)
@@ -631,17 +663,21 @@ examples: sparrow check series_data --key series_id --time period
 		if *approx {
 			// the min/avg/max-per-entity needs a full GROUP BY; under --approx
 			// report just the entity estimate + the derived average
-			if row, err := row1("SELECT COUNT(*), approx_count_distinct(hash(" + gb + ")) FROM " + texpr); err != nil {
+			if row, err := row1("SELECT COUNT(*), approx_count_distinct(" + approxKeyExpr(qcols) + ") FROM " + texpr); err != nil {
 				d.emit(checkResult{Check: "coverage", Status: "error", Detail: firstLine(err)})
 			} else if row != nil {
 				total, _ := strconv.ParseFloat(row[0], 64)
 				ent, _ := strconv.ParseFloat(row[1], 64)
+				if ent > total { // HLL overshoot — entities can't exceed rows (matches keys/profile)
+					ent = total
+				}
 				avg := 0.0
 				if ent > 0 {
 					avg = total / ent
 				}
 				d.emit(checkResult{Check: "coverage", Status: "ok",
-					Detail: fmt.Sprintf("≈ %s entities · avg %.0f rows each (approx)", groupDigits(row[1]), avg)})
+					Detail: fmt.Sprintf("≈ %s entities · avg %.0f rows each (approx)",
+						groupDigits(fmt.Sprintf("%.0f", ent)), avg)})
 			}
 		} else if row, err := row1("SELECT COUNT(*), MIN(c), AVG(c), MAX(c) FROM (SELECT COUNT(*) AS c FROM " +
 			texpr + " GROUP BY " + gb + ") AS s"); err != nil {
