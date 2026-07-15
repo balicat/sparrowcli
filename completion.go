@@ -44,7 +44,7 @@ var cmdOwnFlags = map[string][]string{
 	"sql":        {"f", "substrait", "o", "max-rows", "encrypt-key", "stats", "ipc"},
 	"query":      {"cols", "where", "order", "desc", "limit", "o", "max-rows", "encrypt-key", "stats", "ipc"},
 	"doctor":     {"o", "server"},
-	"check":      {"key", "time", "value", "max-age", "strict", "o"},
+	"check":      {"key", "time", "value", "max-age", "strict", "show-violations", "o"},
 	"diff":       {"against", "time", "o"},
 	"ping":       {"n", "o"},
 	"feedback":   {"category", "from"},

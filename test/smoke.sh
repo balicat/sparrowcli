@@ -131,6 +131,10 @@ UNION ALL SELECT 'DUP', DATE '2026-06-05', 1.0 FROM range(2) x(r)" -o csv
 t check-dirty 1 "$BIN" check checkme --key k
 has check-dup "duplicated (k, t)"
 has check-frozen "FLAT"
+# --show-violations: the offending key ×count and the conflicting value(s)
+t check-violations 1 "$BIN" check checkme --key k --show-violations
+has check-viol-mult "DUP.*×2"
+has check-viol-val "v:"
 t check-json 1 "$BIN" check checkme --key k -o json
 if command -v python3 >/dev/null; then
   python3 -c "import json; r=json.load(open('$OUT')); assert r['ok'] is False and r['table']=='checkme', r" \

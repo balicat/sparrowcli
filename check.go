@@ -144,6 +144,37 @@ func queryCol(ctx context.Context, cl *flightsql.Client, sql string, limit int) 
 	return out, nil
 }
 
+// queryRows fetches up to limit rows, each as its full slice of column cells.
+func queryRows(ctx context.Context, cl *flightsql.Client, sql string, limit int) ([][]string, error) {
+	info, err := cl.Execute(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	var out [][]string
+	for _, ep := range info.Endpoint {
+		rdr, err := cl.DoGet(ctx, ep.Ticket)
+		if err != nil {
+			return out, err
+		}
+		for rdr.Next() {
+			rec := rdr.Record()
+			for r := 0; r < int(rec.NumRows()) && len(out) < limit; r++ {
+				cells := make([]string, rec.NumCols())
+				for c := range cells {
+					cells[c] = cell(rec.Column(c), r)
+				}
+				out = append(out, cells)
+			}
+		}
+		err = rdr.Err()
+		rdr.Release()
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
 func firstLine(err error) string {
 	s := err.Error()
 	if i := strings.IndexByte(s, '\n'); i > 0 {
@@ -175,6 +206,7 @@ examples: sparrow check series_data --key series_id --time period
 	valueF := fs.String("value", "", "value column for the frozen-series check (default: the sole numeric column)")
 	maxAgeF := fs.String("max-age", "", `warn when the newest time point is older than this ("7d", "48h")`)
 	strict := fs.Bool("strict", false, "treat warnings as failures (exit 1) — for CI gates")
+	showViol := fs.Bool("show-violations", false, "on a finding, emit sample offending keys + their conflicting values (up to 10), so you don't re-run the GROUP BY by hand")
 	output := fs.String("o", "", `output: "json" for a machine-readable report`)
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
@@ -369,6 +401,28 @@ examples: sparrow check series_data --key series_id --time period
 		d.emit(checkResult{Check: "nulls", Status: st, Detail: detail, Lines: lines})
 	}
 
+	// value column (hoisted: --show-violations on the keys check wants it too,
+	// not just the frozen check below)
+	valueCol := *valueF
+	var numericCands []string
+	for _, f := range schema.Fields() {
+		if !isNumericType(f.Type.ID()) || f.Name == timeCol {
+			continue
+		}
+		isKey := false
+		for _, k := range keys {
+			if f.Name == k {
+				isKey = true
+			}
+		}
+		if !isKey {
+			numericCands = append(numericCands, f.Name)
+		}
+	}
+	if valueCol == "" && len(numericCands) == 1 { // sole candidate: auto-pick
+		valueCol = numericCands[0]
+	}
+
 	// ── duplicate keys: (key, time) when --time is set, else key ──────────
 	if len(keys) == 0 {
 		d.emit(checkResult{Check: "keys", Status: "skip", Detail: "pass --key <col[,col]> to check uniqueness"})
@@ -393,11 +447,34 @@ examples: sparrow check series_data --key series_id --time period
 					Detail: "(" + strings.Join(uniq, ", ") + ") is unique"})
 			} else {
 				nq++
-				ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
-					" GROUP BY "+gb+" HAVING COUNT(*) > 1 LIMIT 3", 3)
-				d.emit(checkResult{Check: "keys", Status: "fail",
-					Detail: groupDigits(row[0]) + " duplicated (" + strings.Join(uniq, ", ") + ") groups",
-					Lines:  evLines("e.g. ", ev)})
+				res := checkResult{Check: "keys", Status: "fail",
+					Detail: groupDigits(row[0]) + " duplicated (" + strings.Join(uniq, ", ") + ") groups"}
+				if *showViol {
+					// full offending tuples + their conflicting values, in one
+					// server-side pass — the GROUP BY the caller would run by hand
+					sel := gb + ", COUNT(*) AS n"
+					if valueCol != "" {
+						sel += ", STRING_AGG(DISTINCT CAST(" + quoteIdent(valueCol) +
+							" AS VARCHAR), ' | ') AS vals"
+					}
+					rows, e := queryRows(ctx, cl, "SELECT "+sel+" FROM "+texpr+
+						" GROUP BY "+gb+" HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 10", 10)
+					if e == nil {
+						for _, r := range rows {
+							keyPart := strings.Join(r[:len(uniq)], ", ")
+							line := keyPart + "  ×" + r[len(uniq)]
+							if valueCol != "" && len(r) > len(uniq)+1 {
+								line += "  " + valueCol + ": " + r[len(uniq)+1]
+							}
+							res.Lines = append(res.Lines, line)
+						}
+					}
+				} else {
+					ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
+						" GROUP BY "+gb+" HAVING COUNT(*) > 1 LIMIT 3", 3)
+					res.Lines = evLines("e.g. ", ev)
+				}
+				d.emit(res)
 			}
 		}
 	}
@@ -461,25 +538,7 @@ examples: sparrow check series_data --key series_id --time period
 	}
 
 	// ── frozen series: entities whose value never changes ─────────────────
-	valueCol := *valueF
-	var numericCands []string
-	for _, f := range schema.Fields() {
-		if !isNumericType(f.Type.ID()) || f.Name == timeCol {
-			continue
-		}
-		isKey := false
-		for _, k := range keys {
-			if f.Name == k {
-				isKey = true
-			}
-		}
-		if !isKey {
-			numericCands = append(numericCands, f.Name)
-		}
-	}
-	if valueCol == "" && len(numericCands) == 1 { // sole candidate: auto-pick
-		valueCol = numericCands[0]
-	}
+	// (valueCol + numericCands resolved above, before the keys check)
 	if len(keys) > 0 && valueCol == "" {
 		switch len(numericCands) {
 		case 0:
@@ -511,12 +570,24 @@ examples: sparrow check series_data --key series_id --time period
 					Detail: "no entity holds one constant " + valueCol + " over ≥10 observations"})
 			} else {
 				nq++
-				ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
-					" GROUP BY "+gb+having+" LIMIT 3", 3)
-				d.emit(checkResult{Check: "frozen", Status: "warn",
+				res := checkResult{Check: "frozen", Status: "warn",
 					Detail: groupDigits(row[0]) + " entities have a constant " + valueCol + " across ≥10 observations",
-					Lines:  evLines("e.g. ", ev),
-					Hint:   "constant series often mean a stuck feed or a fill-forward gone wrong"})
+					Hint:   "constant series often mean a stuck feed or a fill-forward gone wrong"}
+				if *showViol {
+					rows, e := queryRows(ctx, cl, "SELECT "+gb+", ANY_VALUE("+qv+") AS v, COUNT("+qv+
+						") AS n FROM "+texpr+" GROUP BY "+gb+having+" ORDER BY n DESC LIMIT 10", 10)
+					if e == nil {
+						for _, r := range rows {
+							res.Lines = append(res.Lines, strings.Join(r[:len(keys)], ", ")+
+								"  = "+r[len(keys)]+" ×"+r[len(keys)+1])
+						}
+					}
+				} else {
+					ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
+						" GROUP BY "+gb+having+" LIMIT 3", 3)
+					res.Lines = evLines("e.g. ", ev)
+				}
+				d.emit(res)
 			}
 		}
 	}
