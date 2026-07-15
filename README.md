@@ -37,6 +37,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) instead) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers (`--strict` fails on warnings; `--show-violations` emits the offending keys + conflicting values) | server-side SQL aggregates — the table is never downloaded |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
+| `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper. Exit 1 if exposed | benign probes; run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
 | `sparrow feedback "msg"` | send feedback to the sparrow maintainers | HTTPS to sparrowflight.io — independent of whichever server you use |
 | `sparrow completion bash\|zsh\|fish` | shell tab-completion script | — |

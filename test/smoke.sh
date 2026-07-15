@@ -143,6 +143,16 @@ fi
 t check-missing-table 1 "$BIN" check no_such_table
 t check-usage 3 "$BIN" check
 
+# ── audit: security surface (the fixture is an unhardened DuckDB → exposed) ─
+t audit 1 "$BIN" audit
+has audit-exposed "exposed"
+has audit-fileread "file-read"
+t audit-json 1 "$BIN" audit -o json
+if command -v python3 >/dev/null; then
+  python3 -c "import json; r=json.load(open('$OUT')); assert r['exposed'] >= 1, r" \
+    || { echo "FAIL audit-json-shape"; fails=$((fails + 1)); }
+fi
+
 # ── diagnostics ──────────────────────────────────────────────────────────
 t doctor 0 "$BIN" doctor
 t doctor-json 0 "$BIN" doctor -o json

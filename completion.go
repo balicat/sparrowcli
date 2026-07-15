@@ -27,6 +27,7 @@ var cmdDesc = map[string]string{
 	"doctor":     "layered connection diagnosis",
 	"check":      "data-quality checks on a table",
 	"diff":       "compare a table across two servers",
+	"audit":      "security surface probe of a server you operate",
 	"ping":       "latency percentiles: bare TCP vs warm RPC",
 	"feedback":   "send feedback to the sparrow maintainers",
 	"profiles":   "list / use / rm saved profiles",
@@ -46,6 +47,7 @@ var cmdOwnFlags = map[string][]string{
 	"doctor":     {"o", "server"},
 	"check":      {"key", "time", "value", "max-age", "strict", "show-violations", "o"},
 	"diff":       {"against", "time", "o"},
+	"audit":      {"o"},
 	"ping":       {"n", "o"},
 	"feedback":   {"category", "from"},
 	"profiles":   {},
@@ -57,7 +59,7 @@ var cmdOwnFlags = map[string][]string{
 // serverCmds get the shared connection flags in addition to their own
 var serverCmds = map[string]bool{
 	"connect": true, "orient": true, "ls": true, "info": true, "sql": true,
-	"query": true, "doctor": true, "check": true, "diff": true, "ping": true,
+	"query": true, "doctor": true, "check": true, "diff": true, "audit": true, "ping": true,
 }
 
 func completionCommands() []string {
