@@ -78,9 +78,10 @@ columnar all the way:
 
 ```sh
 sparrow sql "SELECT period, value FROM series_data WHERE series_id='PET.RWTC.D'" \
-  | duckdb -c "SELECT COUNT(*), MIN(value), MAX(value) FROM read_arrow('/dev/stdin')"
+  | duckdb -c "LOAD arrow; SELECT COUNT(*), MIN(value), MAX(value) FROM read_arrow('/dev/stdin')"
 # → 10217 · -36.98 · 145.31 — forty years of WTI without leaving Arrow
-# (one-time setup: duckdb -c "INSTALL arrow FROM community")
+# (one-time setup: duckdb -c "INSTALL arrow FROM community" — read_arrow is a
+#  community extension, so the explicit LOAD is required; it never autoloads)
 ```
 
 ## Security
