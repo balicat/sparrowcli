@@ -70,6 +70,33 @@ has query-rows "999"
 [ "$(grep -c '^99' "$OUT")" = 3 ] || { echo "FAIL query-limit: $(cat "$OUT")"; fails=$((fails + 1)); }
 t query-usage 3 "$BIN" query
 
+# ── head: the LIMIT-n preview shortcut ───────────────────────────────────
+t head 0 "$BIN" head smoke 5 -o csv
+[ "$(grep -c '^[0-9]' "$OUT")" = 5 ] || { echo "FAIL head-count: $(cat "$OUT" | wc -l)"; fails=$((fails + 1)); }
+t head-badn 3 "$BIN" head smoke notanumber
+
+# ── profile: the column profiler ─────────────────────────────────────────
+t profile 0 "$BIN" profile smoke
+has profile-cols "distinct"
+t profile-json 0 "$BIN" profile smoke -o json
+if command -v python3 >/dev/null; then
+  python3 -c "import json; r=json.load(open('$OUT')); assert r['rows']==1000 and len(r['columns'])==2, r" \
+    || { echo "FAIL profile-json-shape"; fails=$((fails + 1)); }
+fi
+
+# ── sql --schema (columns+types, no rows) ────────────────────────────────
+t sql-schema 0 "$BIN" sql "SELECT id, val FROM smoke" --schema
+has schema-col "id"
+has schema-type "int"
+
+# ── sql --bigint-as-string (int64 → quoted) ──────────────────────────────
+t sql-bigint 0 "$BIN" sql "SELECT 9223372036854775807::BIGINT AS big" --bigint-as-string -o jsonl
+has bigint-quoted '"big":"9223372036854775807"'
+
+# ── reserved-word hint on a parser error ─────────────────────────────────
+t sql-reserved 1 "$BIN" sql "SELECT end FROM smoke"
+has reserved-hint 'quote' "$ERR"
+
 # ── substrait: the guard path (fixture advertises Substrait=False, so the
 #    pre-check must refuse with a clear message BEFORE sending the plan) ──
 PLAN=$(mktemp)
@@ -140,6 +167,21 @@ if command -v python3 >/dev/null; then
   python3 -c "import json; r=json.load(open('$OUT')); assert r['ok'] is False and r['table']=='checkme', r" \
     || { echo "FAIL check-json-shape"; fails=$((fails + 1)); }
 fi
+# --explain echoes each stage's SQL to stderr
+t check-explain 1 "$BIN" check checkme --key k --explain
+has check-explain-sql "sql> " "$ERR"
+# --approx: memory-safe uniqueness (HLL) — needs scale to be stable, so use a
+# 100k unique table; expect ≈ unique (within the HLL error band), exit 0
+"$BIN" sql "CREATE OR REPLACE TABLE bigkeys AS SELECT r AS id FROM range(100000) t(r)" -o csv >/dev/null 2>&1
+t check-approx 0 "$BIN" check bigkeys --key id --approx
+has check-approx-word "unique (approx"
+"$BIN" sql "DROP TABLE bigkeys" -o csv >/dev/null 2>&1
+# --baseline: a clean run vs a dirty baseline flags the regression
+"$BIN" check smoke --key id -o json >/tmp/smoke_base.json 2>/dev/null
+t check-baseline-clean 0 "$BIN" check smoke --key id --baseline /tmp/smoke_base.json
+"$BIN" check checkme --key k -o json >/tmp/dirty_base.json 2>/dev/null || true
+t check-baseline-better 0 "$BIN" check smoke --key id --baseline /tmp/dirty_base.json
+rm -f /tmp/smoke_base.json /tmp/dirty_base.json
 t check-missing-table 1 "$BIN" check no_such_table
 t check-usage 3 "$BIN" check
 

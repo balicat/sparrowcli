@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -193,6 +194,59 @@ func splitCols(s string) []string {
 	return out
 }
 
+// statusRank orders check verdicts by severity, for baseline regression diff.
+func statusRank(s string) int {
+	switch s {
+	case "warn":
+		return 1
+	case "error":
+		return 2
+	case "fail":
+		return 3
+	}
+	return 0 // ok / skip
+}
+
+// diffBaseline compares the current report against a prior `check -o json`
+// report and prints any regression (a check that got worse, or a new
+// worse-than-ok check). Returns the regression count.
+func diffBaseline(path string, cur doctorReport, jsonMode bool) int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "baseline: cannot read "+path+": "+firstLine(err))
+		return 0
+	}
+	var base doctorReport
+	if err := json.Unmarshal(b, &base); err != nil {
+		fmt.Fprintln(os.Stderr, "baseline: "+path+" is not a check -o json report: "+firstLine(err))
+		return 0
+	}
+	prior := map[string]string{}
+	for _, c := range base.Checks {
+		prior[c.Check] = c.Status
+	}
+	var regressions []string
+	for _, c := range cur.Checks {
+		was, seen := prior[c.Check]
+		if !seen {
+			if statusRank(c.Status) > 0 {
+				regressions = append(regressions, fmt.Sprintf("%s: new %s (%s)", c.Check, c.Status, c.Detail))
+			}
+			continue
+		}
+		if statusRank(c.Status) > statusRank(was) {
+			regressions = append(regressions, fmt.Sprintf("%s: %s → %s (%s)", c.Check, was, c.Status, c.Detail))
+		}
+	}
+	if !jsonMode && len(regressions) > 0 {
+		fmt.Println("\nregressions vs baseline:")
+		for _, r := range regressions {
+			fmt.Println(" ✗ " + r)
+		}
+	}
+	return len(regressions)
+}
+
 func cmdCheck(args []string) error {
 	fs := newFlagSet("check", `usage: sparrow check <table> [flags]
 data doctor: a server-side statistical health screen — rows, nulls, duplicate
@@ -207,6 +261,9 @@ examples: sparrow check series_data --key series_id --time period
 	maxAgeF := fs.String("max-age", "", `warn when the newest time point is older than this ("7d", "48h")`)
 	strict := fs.Bool("strict", false, "treat warnings as failures (exit 1) — for CI gates")
 	showViol := fs.Bool("show-violations", false, "on a finding, emit sample offending keys + their conflicting values (up to 10), so you don't re-run the GROUP BY by hand")
+	approx := fs.Bool("approx", false, "memory-safe uniqueness: an approx_count_distinct (HyperLogLog) estimate instead of a full GROUP BY — for tables too big to materialize every key")
+	explain := fs.Bool("explain", false, "echo each stage's SQL to stderr (reproduce or extend a check by hand)")
+	baseline := fs.String("baseline", "", "compare against a prior `sparrow check -o json` report; exit 1 on any regression")
 	output := fs.String("o", "", `output: "json" for a machine-readable report`)
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
@@ -245,10 +302,25 @@ examples: sparrow check series_data --key series_id --time period
 	t0 := time.Now()
 	nq := 0
 	texpr := tableExpr(table)
-	row1 := func(sql string) ([]string, error) { nq++; return queryRow(ctx, cl, sql) }
+	explainSQL := func(sql string) {
+		if *explain {
+			fmt.Fprintln(os.Stderr, "sql> "+strings.Join(strings.Fields(sql), " "))
+		}
+	}
+	row1 := func(sql string) ([]string, error) { nq++; explainSQL(sql); return queryRow(ctx, cl, sql) }
+	qcol := func(sql string, lim int) ([]string, error) { nq++; explainSQL(sql); return queryCol(ctx, cl, sql, lim) }
+	qrows := func(sql string, lim int) ([][]string, error) {
+		nq++
+		explainSQL(sql)
+		return queryRows(ctx, cl, sql, lim)
+	}
 
 	finish := func() error {
 		d.rep.OK = d.fails == 0 && d.errs == 0
+		regressions := 0
+		if *baseline != "" {
+			regressions = diffBaseline(*baseline, d.rep, d.json)
+		}
 		if d.json {
 			b, _ := json.MarshalIndent(d.rep, "", "  ")
 			fmt.Println(string(b))
@@ -266,6 +338,9 @@ examples: sparrow check series_data --key series_id --time period
 		}
 		if d.errs > 0 {
 			return fmt.Errorf("check: %d check(s) could not run — see the ! lines", d.errs)
+		}
+		if regressions > 0 {
+			return fmt.Errorf("check: %d regression(s) vs the baseline", regressions)
 		}
 		if *strict && d.warns > 0 {
 			return fmt.Errorf("check: %d warning(s) under --strict", d.warns)
@@ -437,16 +512,43 @@ examples: sparrow check series_data --key series_id --time period
 			qcols[i] = quoteIdent(c)
 		}
 		gb := strings.Join(qcols, ", ")
-		if row, err := row1("SELECT COUNT(*) FROM (SELECT " + gb + " FROM " + texpr +
+		if *approx {
+			// memory-safe: one pass, HyperLogLog — never materializes the keys.
+			// total > distinct ⇒ duplicates; the gap is an ESTIMATE (~2% error).
+			if row, err := row1("SELECT COUNT(*), approx_count_distinct(hash(" + gb +
+				")) FROM " + texpr); err != nil {
+				d.emit(checkResult{Check: "keys", Status: "error", Detail: firstLine(err)})
+			} else if row != nil {
+				total, _ := strconv.ParseInt(row[0], 10, 64)
+				distinct, _ := strconv.ParseInt(row[1], 10, 64)
+				dupEst := total - distinct
+				shownDistinct := distinct
+				if shownDistinct > total { // HLL can overshoot; a key can't exceed rows
+					shownDistinct = total
+				}
+				kd := "(" + strings.Join(uniq, ", ") + ")"
+				// HyperLogLog carries ~2-5% error, so only a clear gap counts,
+				// and even then it's a WARN (an estimate) — --strict makes it gate
+				if float64(dupEst) <= 0.05*float64(total) {
+					d.emit(checkResult{Check: "keys", Status: "ok",
+						Detail: kd + " is ≈ unique (approx: " + groupDigits(fmt.Sprint(shownDistinct)) + " distinct of " + groupDigits(row[0]) + ")"})
+				} else {
+					d.emit(checkResult{Check: "keys", Status: "warn",
+						Detail: fmt.Sprintf("≈ %s duplicate rows in %s (HyperLogLog estimate — run without --approx for exact groups + --show-violations)",
+							groupDigits(fmt.Sprint(dupEst)), kd),
+						Hint: "an estimate, not exact; use --strict to gate on it"})
+				}
+			}
+		} else if row, err := row1("SELECT COUNT(*) FROM (SELECT " + gb + " FROM " + texpr +
 			" GROUP BY " + gb + " HAVING COUNT(*) > 1) AS d"); err != nil {
-			d.emit(checkResult{Check: "keys", Status: "error", Detail: firstLine(err)})
+			d.emit(checkResult{Check: "keys", Status: "error", Detail: firstLine(err),
+				Hint: "on a huge table this can be memory-heavy — try --approx for a HyperLogLog estimate"})
 		} else if row != nil {
 			n, _ := strconv.ParseInt(row[0], 10, 64)
 			if n == 0 {
 				d.emit(checkResult{Check: "keys", Status: "ok",
 					Detail: "(" + strings.Join(uniq, ", ") + ") is unique"})
 			} else {
-				nq++
 				res := checkResult{Check: "keys", Status: "fail",
 					Detail: groupDigits(row[0]) + " duplicated (" + strings.Join(uniq, ", ") + ") groups"}
 				if *showViol {
@@ -457,7 +559,7 @@ examples: sparrow check series_data --key series_id --time period
 						sel += ", STRING_AGG(DISTINCT CAST(" + quoteIdent(valueCol) +
 							" AS VARCHAR), ' | ') AS vals"
 					}
-					rows, e := queryRows(ctx, cl, "SELECT "+sel+" FROM "+texpr+
+					rows, e := qrows("SELECT "+sel+" FROM "+texpr+
 						" GROUP BY "+gb+" HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 10", 10)
 					if e == nil {
 						for _, r := range rows {
@@ -470,7 +572,7 @@ examples: sparrow check series_data --key series_id --time period
 						}
 					}
 				} else {
-					ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
+					ev, _ := qcol("SELECT "+qcols[0]+" FROM "+texpr+
 						" GROUP BY "+gb+" HAVING COUNT(*) > 1 LIMIT 3", 3)
 					res.Lines = evLines("e.g. ", ev)
 				}
@@ -526,7 +628,22 @@ examples: sparrow check series_data --key series_id --time period
 			qcols[i] = quoteIdent(c)
 		}
 		gb := strings.Join(qcols, ", ")
-		if row, err := row1("SELECT COUNT(*), MIN(c), AVG(c), MAX(c) FROM (SELECT COUNT(*) AS c FROM " +
+		if *approx {
+			// the min/avg/max-per-entity needs a full GROUP BY; under --approx
+			// report just the entity estimate + the derived average
+			if row, err := row1("SELECT COUNT(*), approx_count_distinct(hash(" + gb + ")) FROM " + texpr); err != nil {
+				d.emit(checkResult{Check: "coverage", Status: "error", Detail: firstLine(err)})
+			} else if row != nil {
+				total, _ := strconv.ParseFloat(row[0], 64)
+				ent, _ := strconv.ParseFloat(row[1], 64)
+				avg := 0.0
+				if ent > 0 {
+					avg = total / ent
+				}
+				d.emit(checkResult{Check: "coverage", Status: "ok",
+					Detail: fmt.Sprintf("≈ %s entities · avg %.0f rows each (approx)", groupDigits(row[1]), avg)})
+			}
+		} else if row, err := row1("SELECT COUNT(*), MIN(c), AVG(c), MAX(c) FROM (SELECT COUNT(*) AS c FROM " +
 			texpr + " GROUP BY " + gb + ") AS s"); err != nil {
 			d.emit(checkResult{Check: "coverage", Status: "error", Detail: firstLine(err)})
 		} else if row != nil {
@@ -569,12 +686,11 @@ examples: sparrow check series_data --key series_id --time period
 				d.emit(checkResult{Check: "frozen", Status: "ok",
 					Detail: "no entity holds one constant " + valueCol + " over ≥10 observations"})
 			} else {
-				nq++
 				res := checkResult{Check: "frozen", Status: "warn",
 					Detail: groupDigits(row[0]) + " entities have a constant " + valueCol + " across ≥10 observations",
 					Hint:   "constant series often mean a stuck feed or a fill-forward gone wrong"}
 				if *showViol {
-					rows, e := queryRows(ctx, cl, "SELECT "+gb+", ANY_VALUE("+qv+") AS v, COUNT("+qv+
+					rows, e := qrows("SELECT "+gb+", ANY_VALUE("+qv+") AS v, COUNT("+qv+
 						") AS n FROM "+texpr+" GROUP BY "+gb+having+" ORDER BY n DESC LIMIT 10", 10)
 					if e == nil {
 						for _, r := range rows {
@@ -583,7 +699,7 @@ examples: sparrow check series_data --key series_id --time period
 						}
 					}
 				} else {
-					ev, _ := queryCol(ctx, cl, "SELECT "+qcols[0]+" FROM "+texpr+
+					ev, _ := qcol("SELECT "+qcols[0]+" FROM "+texpr+
 						" GROUP BY "+gb+having+" LIMIT 3", 3)
 					res.Lines = evLines("e.g. ", ev)
 				}

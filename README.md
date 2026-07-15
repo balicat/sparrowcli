@@ -30,12 +30,14 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 |---|---|---|
 | `sparrow connect <uri>` | verify + save a profile | vendor probe via `GetSqlInfo`, `SELECT 1` fallback |
 | `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
-| `sparrow ls [pattern]` | list tables (pattern semantics are the server's: SQL `LIKE` on most) | `GetTables` — the one discovery RPC that works everywhere |
+| `sparrow ls [pattern]` | list tables; the pattern is a server-side SQL `LIKE` (`%`, `_`, case-sensitive) | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
-| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` for the stream anatomy; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan instead of SQL) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
+| `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
+| `sparrow profile <table>` | per-column nulls %, approx-distinct, min, max — one server-side pass | one aggregate query |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) instead) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
-| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers (`--strict` fails on warnings; `--show-violations` emits the offending keys + conflicting values) | server-side SQL aggregates — the table is never downloaded |
+| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper. Exit 1 if exposed | benign probes; run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |

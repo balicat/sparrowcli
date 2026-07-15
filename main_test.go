@@ -487,3 +487,28 @@ func TestCompletionTables(t *testing.T) {
 		t.Errorf("feedback must not take connection flags: %s", fb)
 	}
 }
+
+func TestReservedWordHint(t *testing.T) {
+	perr := errors.New(`Parser Error: syntax error at or near "end"`)
+	if h := reservedWordHint("SELECT end FROM t", perr); !strings.Contains(h, `"end"`) {
+		t.Errorf("expected end hint, got %q", h)
+	}
+	// a parser error with no reserved word → no hint
+	if h := reservedWordHint("SELECT foo FROM t", perr); h != "" {
+		t.Errorf("unexpected hint: %q", h)
+	}
+	// a non-parser error → no hint even if a reserved word is present
+	if h := reservedWordHint("SELECT end FROM t", errors.New("connection refused")); h != "" {
+		t.Errorf("hint on non-parser error: %q", h)
+	}
+}
+
+func TestStatusRank(t *testing.T) {
+	if !(statusRank("ok") < statusRank("warn") && statusRank("warn") < statusRank("error") &&
+		statusRank("error") < statusRank("fail")) {
+		t.Error("status severity order wrong")
+	}
+	if statusRank("skip") != 0 {
+		t.Error("skip should rank 0")
+	}
+}

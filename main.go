@@ -321,11 +321,12 @@ var stdoutFormats = map[string]bool{
 }
 
 type sink struct {
-	format string
-	w      io.Writer
-	closer io.Closer // file to close, nil for stdout
-	path   string    // file path, "" for stdout
-	encKey []byte    // parquet only: Parquet Modular Encryption footer key
+	format    string
+	w         io.Writer
+	closer    io.Closer // file to close, nil for stdout
+	path      string    // file path, "" for stdout
+	encKey    []byte    // parquet only: Parquet Modular Encryption footer key
+	bigintStr bool      // json/jsonl: emit int64/uint64 as quoted strings
 }
 
 // loadKey parses --encrypt-key: a hex string, env:VAR (hex), or file:path
@@ -404,7 +405,59 @@ func resolveSink(o string) (sink, error) {
 // reorderJSON rewrites one RecordToJSON row so keys follow the schema's
 // column order instead of Go's alphabetical map order — values are kept as
 // raw bytes, so int64 precision survives untouched.
-func reorderJSON(line string, schema *arrow.Schema) string {
+// sqlReservedWords — reserved words that commonly double as COLUMN names, so
+// an unquoted reference is a parser error. Deliberately excludes pure clause
+// keywords (select/from/where/order/…) which would false-fire on any unrelated
+// syntax error. The ones people actually hit: the tester tripped on
+// end/start/rows.
+var sqlReservedWords = map[string]bool{
+	"end": true, "start": true, "rows": true, "range": true, "default": true,
+	"table": true, "column": true, "values": true, "primary": true,
+	"references": true, "constraint": true, "window": true, "returning": true,
+	"interval": true, "grouping": true, "partition": true, "qualify": true,
+}
+
+// reservedWordHint spots a parser error caused by an unquoted reserved word in
+// the query and suggests quoting it. Returns "" when it doesn't apply.
+func reservedWordHint(query string, err error) string {
+	e := strings.ToLower(err.Error())
+	if !strings.Contains(e, "syntax error") && !strings.Contains(e, "parser error") &&
+		!strings.Contains(e, "parsererror") {
+		return ""
+	}
+	seen := map[string]bool{}
+	var hits []string
+	for _, tok := range strings.FieldsFunc(query, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_')
+	}) {
+		lw := strings.ToLower(tok)
+		if sqlReservedWords[lw] && !seen[lw] {
+			seen[lw] = true
+			hits = append(hits, tok)
+		}
+	}
+	if len(hits) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(hits))
+	for i, h := range hits {
+		quoted[i] = `"` + h + `"`
+	}
+	return "reserved word(s) " + strings.Join(hits, ", ") +
+		" must be quoted as an identifier: " + strings.Join(quoted, ", ")
+}
+
+// quoteRawNumber wraps a bare JSON number in quotes (for --bigint-as-string,
+// so JS consumers keep full int64 precision). null / already-string pass through.
+func quoteRawNumber(v json.RawMessage) json.RawMessage {
+	s := strings.TrimSpace(string(v))
+	if s == "" || s == "null" || s[0] == '"' {
+		return v
+	}
+	return json.RawMessage(`"` + s + `"`)
+}
+
+func reorderJSON(line string, schema *arrow.Schema, bigintStr bool) string {
 	var m map[string]json.RawMessage
 	if json.Unmarshal([]byte(line), &m) != nil {
 		return line
@@ -424,6 +477,9 @@ func reorderJSON(line string, schema *arrow.Schema) string {
 	}
 	for _, f := range schema.Fields() {
 		if v, ok := m[f.Name]; ok {
+			if bigintStr && (f.Type.ID() == arrow.INT64 || f.Type.ID() == arrow.UINT64) {
+				v = quoteRawNumber(v)
+			}
 			emitKV(f.Name, v)
 			delete(m, f.Name)
 		}
@@ -571,7 +627,7 @@ func (rw *recordWriter) write(rec arrow.Record) error {
 			if ln == "" {
 				continue
 			}
-			ln = reorderJSON(ln, rw.schema)
+			ln = reorderJSON(ln, rw.schema, rw.s.bigintStr)
 			if rw.s.format == "jsonl" {
 				fmt.Fprintln(rw.s.w, ln)
 			} else {
@@ -1214,9 +1270,9 @@ example: sparrow connect grpc+tls://flight.sparrowflight.io:443 --basic demo:dem
 
 func cmdLs(args []string) error {
 	fs := newFlagSet("ls", `usage: sparrow ls [pattern] [flags]
-list tables via GetTables; pattern semantics are the SERVER's (SQL LIKE
-with % and _ on most; the demo server matches substrings, case-sensitive)
-example: sparrow ls -o md`)
+list tables via GetTables; the pattern is a SQL LIKE pattern interpreted by
+the SERVER (% = any run, _ = one char, case-sensitive), e.g. "series_%"
+example: sparrow ls "series_%" -o md`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path (.parquet .csv …)")
 	pos := parseFlags(fs, args)
@@ -1266,6 +1322,8 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	encKey := fs.String("encrypt-key", "", "encrypt parquet output (Parquet Modular Encryption): hex, env:VAR or file:path")
 	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr: plan / first byte / stream, rows, wire bytes, throughput")
 	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr: message type, rows, body bytes, codec, custom metadata")
+	schemaOnly := fs.Bool("schema", false, "print the result's column names + Arrow types and exit — no rows fetched")
+	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl (preserve precision for JS consumers)")
 	pos := parseFlags(fs, args)
 	var query string
 	var plan []byte
@@ -1301,14 +1359,65 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		return usagef(`usage: sparrow sql "SELECT ..." | sparrow sql - | sparrow sql -f query.sql`)
 	}
 
-	return execStatement(cf, query, plan, *output, *encKey, *maxRows, *statsOn, *ipcOn)
+	if *schemaOnly {
+		if plan != nil {
+			return usagef("--schema and --substrait can't be combined")
+		}
+		return printQuerySchema(cf, query)
+	}
+	return execStatement(cf, query, plan, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+}
+
+// printQuerySchema executes a query but reads only the result's schema —
+// the server plans it and returns the Arrow schema without us draining rows.
+func printQuerySchema(cf *connFlags, query string) error {
+	p, _, err := cf.resolve()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cl, ctx, err := dial(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	info, err := cl.Execute(ctx, query)
+	if err != nil {
+		return err
+	}
+	var schema *arrow.Schema
+	if len(info.Schema) > 0 {
+		schema, _ = flight.DeserializeSchema(info.Schema, memory.DefaultAllocator)
+	}
+	if schema == nil { // some servers only declare the schema on the stream
+		rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+		if err != nil {
+			return err
+		}
+		schema = rdr.Schema()
+		rdr.Release()
+	}
+	if schema == nil {
+		return fmt.Errorf("no schema returned")
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "column\ttype\tnullable")
+	for _, f := range schema.Fields() {
+		null := ""
+		if f.Nullable {
+			null = "yes"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", f.Name, f.Type, null)
+	}
+	return tw.Flush()
 }
 
 // execStatement is the shared execution core behind sql and query:
 // dial, run, sink, and the optional --stats / --ipc reports. A non-nil
 // plan executes as a Substrait plan (CommandStatementSubstraitPlan)
 // instead of SQL text — gated on the server's advertised capability.
-func execStatement(cf *connFlags, query string, plan []byte, output, encKey string, maxRows int, statsOn, ipcOn bool) error {
+func execStatement(cf *connFlags, query string, plan []byte, output, encKey string, maxRows int, statsOn, ipcOn, bigintStr bool) error {
 	p, _, err := cf.resolve()
 	if err != nil {
 		return err
@@ -1349,6 +1458,12 @@ func execStatement(cf *connFlags, query string, plan []byte, output, encKey stri
 		info, err = cl.Execute(ctx, query)
 	}
 	if err != nil {
+		if h := reservedWordHint(query, err); h != "" {
+			// pre-strip the gRPC "Detail:" tail: main()'s strip is anchored to
+			// end-of-string and would miss it once the hint is appended
+			msg := grpcDetailRe.ReplaceAllString(err.Error(), "")
+			return fmt.Errorf("%s\nhint: %s", msg, h)
+		}
 		return err
 	}
 	planMs := time.Since(t0).Milliseconds()
@@ -1374,6 +1489,7 @@ func execStatement(cf *connFlags, query string, plan []byte, output, encKey stri
 		}
 		s.encKey = k
 	}
+	s.bigintStr = bigintStr
 	var st *qstats
 	if statsOn {
 		st = &qstats{}
@@ -2491,6 +2607,8 @@ usage:
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow sql --substrait plan.pb                 execute a serialized Substrait plan
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
+  sparrow head <table> [n]                        preview the first n rows (default 10)
+  sparrow profile <table> [-o json]               per-column nulls · distinct · min · max
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
@@ -2532,6 +2650,10 @@ func main() {
 		err = cmdSQL(os.Args[2:])
 	case "query":
 		err = cmdQuery(os.Args[2:])
+	case "head":
+		err = cmdHead(os.Args[2:])
+	case "profile":
+		err = cmdProfile(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	case "diff":
@@ -2566,6 +2688,10 @@ func main() {
 				err = cmdSQL([]string{"-h"})
 			case "query":
 				err = cmdQuery([]string{"-h"})
+			case "head":
+				err = cmdHead([]string{"-h"})
+			case "profile":
+				err = cmdProfile([]string{"-h"})
 			case "check":
 				err = cmdCheck([]string{"-h"})
 			case "diff":

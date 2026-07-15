@@ -294,11 +294,16 @@ func TestReorderJSON(t *testing.T) {
 	defer rec.Release()
 	in := `{"name":"a","id":9223372036854775807}`
 	want := `{"id":9223372036854775807,"name":"a"}`
-	if got := reorderJSON(in, rec.Schema()); got != want {
+	if got := reorderJSON(in, rec.Schema(), false); got != want {
 		t.Errorf("reorder: %s", got)
 	}
-	if got := reorderJSON("not json", rec.Schema()); got != "not json" {
+	if got := reorderJSON("not json", rec.Schema(), false); got != "not json" {
 		t.Errorf("passthrough: %s", got)
+	}
+	// --bigint-as-string: int64 id becomes a quoted string, name untouched
+	wantBig := `{"id":"9223372036854775807","name":"a"}`
+	if got := reorderJSON(in, rec.Schema(), true); got != wantBig {
+		t.Errorf("bigint-as-string: %s", got)
 	}
 }
 

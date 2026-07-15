@@ -26,6 +26,7 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	encKey := fs.String("encrypt-key", "", "encrypt parquet output: hex, env:VAR or file:path")
 	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr")
 	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr")
+	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef(`usage: sparrow query <table> [--cols a,b] [--where "..."] [--order col] [--desc] [--limit N]`)
@@ -59,5 +60,28 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	if stdoutIsTTY() {
 		fmt.Fprintln(os.Stderr, "sql: "+q)
 	}
-	return execStatement(cf, q, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn)
+	return execStatement(cf, q, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+}
+
+// cmdHead — the SELECT * FROM t LIMIT n shortcut everyone types by hand.
+func cmdHead(args []string) error {
+	fs := newFlagSet("head", `usage: sparrow head <table> [n] [flags]
+preview the first n rows (default 10) of a table — SELECT * FROM t LIMIT n.
+examples: sparrow head series_data · sparrow head trades 20 -o md`)
+	cf := addConnFlags(fs)
+	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path")
+	pos := parseFlags(fs, args)
+	if len(pos) < 1 {
+		return usagef("usage: sparrow head <table> [n]")
+	}
+	n := 10
+	if len(pos) >= 2 {
+		v, err := strconv.Atoi(pos[1])
+		if err != nil || v < 1 {
+			return usagef("head: row count must be a positive integer, got %q", pos[1])
+		}
+		n = v
+	}
+	q := "SELECT * FROM " + tableExpr(pos[0]) + " LIMIT " + strconv.Itoa(n)
+	return execStatement(cf, q, nil, *output, "", n, false, false, false)
 }
