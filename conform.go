@@ -441,6 +441,14 @@ func lintSqlInfo(entries []sqlInfoEntry) (caps string, lint []string) {
 			parts = append(parts, f.name+" "+e.value)
 		}
 	}
+	// Sparrow vendor extension (code 10100): a JSON contract of the
+	// client-constructed ticket templates the server accepts for 1-RTT pulls.
+	if e, ok := m[10100]; ok {
+		if ids := directTicketIDs(e.value); ids != "" {
+			parts = append(parts, "direct-tickets ✓ ("+ids+")")
+		}
+	}
+
 	caps = strings.Join(parts, " · ")
 	if caps == "" {
 		lint = append(lint, "no capability flags advertised (SQL / Substrait / transactions / cancel)")
@@ -467,9 +475,31 @@ func lintSqlInfo(entries []sqlInfoEntry) (caps string, lint []string) {
 }
 
 // standardSqlInfoCode — the ranges FlightSql.proto defines: server info
-// 0-11, timeouts 100-101, the SQL_* syntax/feature block 500+.
+// 0-11, timeouts 100-101, the SQL_* syntax/feature block 500+. Plus the
+// Sparrow vendor extension 10100 (direct-ticket contract), a recognized
+// non-standard code so the lint doesn't flag it as a violation.
 func standardSqlInfoCode(c uint32) bool {
-	return c <= 11 || c == 100 || c == 101 || (c >= 500 && c <= 582)
+	return c <= 11 || c == 100 || c == 101 || (c >= 500 && c <= 582) || c == 10100
+}
+
+// directTicketIDs decodes the Sparrow direct-ticket contract (SqlInfo 10100)
+// and returns its template ids, comma-joined — "" if unparseable.
+func directTicketIDs(jsonStr string) string {
+	var v struct {
+		Templates []struct {
+			ID string `json:"id"`
+		} `json:"templates"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &v); err != nil {
+		return ""
+	}
+	ids := make([]string, 0, len(v.Templates))
+	for _, t := range v.Templates {
+		if t.ID != "" {
+			ids = append(ids, t.ID)
+		}
+	}
+	return strings.Join(ids, ", ")
 }
 
 // binaryValue extracts the bytes of a binary-typed cell, or nil.
