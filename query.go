@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -60,7 +61,7 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	if stdoutIsTTY() {
 		fmt.Fprintln(os.Stderr, "sql: "+q)
 	}
-	return execStatement(cf, q, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+	return execStatement(cf, q, nil, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
 }
 
 // cmdHead — the SELECT * FROM t LIMIT n shortcut everyone types by hand.
@@ -83,5 +84,57 @@ examples: sparrow head series_data · sparrow head trades 20 -o md`)
 		n = v
 	}
 	q := "SELECT * FROM " + tableExpr(pos[0]) + " LIMIT " + strconv.Itoa(n)
-	return execStatement(cf, q, nil, *output, "", n, false, false, false)
+	return execStatement(cf, q, nil, nil, *output, "", n, false, false, false)
+}
+
+// cmdDoGet — the 1-RTT pull: a raw ticket straight to DoGet, no
+// GetFlightInfo, no SQL. Flight SQL reads are two round trips by design
+// (query → ticket → stream); servers that accept client-constructed tickets
+// serve known pulls in ONE. Measured on the public demo: 143 ms vs 224 ms
+// for the same 10k-row series.
+func cmdDoGet(args []string) error {
+	fs := newFlagSet("doget", `usage: sparrow doget '<ticket>' [flags]
+1-RTT pull: send a raw ticket STRAIGHT to DoGet — skipping GetFlightInfo
+(and SQL entirely). Ticket dialects are server-specific; Sparrow serving
+nodes accept JSON: {"series": ["ID", ...], "start": "...", "end": "..."}.
+Servers that mint opaque statement handles (GizmoSQL, DataFusion) reject
+raw tickets — use sparrow sql there. doctor --server probes which kind a
+server is ("direct JSON tickets").
+examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
+          sparrow doget '{"series": ["FRED.DFF"], "start": "2020-01-01"}' -o md
+          sparrow doget @ticket.json -o data.parquet
+          echo '{"series": ["PET.RWTC.D"]}' | sparrow doget - --stats`)
+	cf := addConnFlags(fs)
+	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path")
+	encKey := fs.String("encrypt-key", "", "seal parquet output: hex key, env:VAR, or file:path")
+	maxRows := fs.Int("max-rows", 0, "cap rows fetched (0 = format default)")
+	statsOn := fs.Bool("stats", false, "print stream anatomy to stderr")
+	ipcOn := fs.Bool("ipc", false, "print the raw IPC manifest to stderr")
+	bigintStr := fs.Bool("bigint-as-string", false, "emit int64 as quoted strings in JSON output")
+	pos := parseFlags(fs, args)
+	if len(pos) < 1 {
+		return usagef("usage: sparrow doget '<ticket>' (or @file, or - for stdin)")
+	}
+	raw := pos[0]
+	var ticket []byte
+	switch {
+	case raw == "-":
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		ticket = []byte(strings.TrimSpace(string(b)))
+	case strings.HasPrefix(raw, "@"):
+		b, err := os.ReadFile(raw[1:])
+		if err != nil {
+			return err
+		}
+		ticket = []byte(strings.TrimSpace(string(b)))
+	default:
+		ticket = []byte(raw)
+	}
+	if len(ticket) == 0 {
+		return usagef("doget: empty ticket")
+	}
+	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
 }

@@ -158,6 +158,28 @@ func runConform(cf *connFlags, jsonOut bool) error {
 		return fmt.Sprintf("schemas populated (%d/%d tables)", withSchema, total), nil
 	})
 
+	// 1-RTT check: does the server accept a CLIENT-CONSTRUCTED JSON ticket
+	// on DoGet (Sparrow-style {"series": [...]})? If so, known pulls can
+	// skip GetFlightInfo entirely — one round trip instead of two
+	// (`sparrow doget`). A clean stream (even empty) OR an error that echoes
+	// the probe id both mean the JSON dialect was PARSED; an opaque-handle
+	// error means it wasn't.
+	run("direct JSON tickets (1-RTT)", func() (string, error) {
+		const sentinel = "__sparrow_conform_probe__"
+		tk := &flight.Ticket{Ticket: []byte(`{"series": ["` + sentinel + `"]}`)}
+		rdr, err := cl.DoGet(ctx, tk)
+		if err != nil {
+			if strings.Contains(err.Error(), sentinel) {
+				return "JSON tickets parsed (probe id unknown, as expected) — `sparrow doget` works here", nil
+			}
+			return "", fmt.Errorf("opaque statement handles only — 2-RTT SQL (`sparrow sql`)")
+		}
+		for rdr.Next() {
+		}
+		rdr.Release()
+		return "accepted (clean empty result for an unknown id) — `sparrow doget` works here", nil
+	})
+
 	run("GetCatalogs", func() (string, error) {
 		info, err := cl.GetCatalogs(ctx)
 		if err != nil {

@@ -48,7 +48,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.13.1-dev"
+var version = "0.14.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
@@ -1365,7 +1365,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		}
 		return printQuerySchema(cf, query)
 	}
-	return execStatement(cf, query, plan, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+	return execStatement(cf, query, plan, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
 }
 
 // printQuerySchema executes a query but reads only the result's schema —
@@ -1417,7 +1417,7 @@ func printQuerySchema(cf *connFlags, query string) error {
 // dial, run, sink, and the optional --stats / --ipc reports. A non-nil
 // plan executes as a Substrait plan (CommandStatementSubstraitPlan)
 // instead of SQL text — gated on the server's advertised capability.
-func execStatement(cf *connFlags, query string, plan []byte, output, encKey string, maxRows int, statsOn, ipcOn, bigintStr bool) error {
+func execStatement(cf *connFlags, query string, plan []byte, ticket []byte, output, encKey string, maxRows int, statsOn, ipcOn, bigintStr bool) error {
 	p, _, err := cf.resolve()
 	if err != nil {
 		return err
@@ -1441,7 +1441,15 @@ func execStatement(cf *connFlags, query string, plan []byte, output, encKey stri
 
 	var info *flight.FlightInfo
 	var t0 time.Time
-	if plan != nil {
+	if ticket != nil {
+		// 1-RTT direct ticket: no GetFlightInfo, no SQL — the ticket goes
+		// straight to DoGet via a synthetic single-endpoint FlightInfo.
+		// Works on servers that accept client-constructed tickets (Sparrow:
+		// JSON {"series": [...]}); opaque-handle servers reject it.
+		t0 = time.Now()
+		info = &flight.FlightInfo{Endpoint: []*flight.FlightEndpoint{
+			{Ticket: &flight.Ticket{Ticket: ticket}}}}
+	} else if plan != nil {
 		// the tester's spec: pre-check SqlInfo code 5 and fail with a clear
 		// message instead of firing the plan into a raw Unimplemented
 		switch substraitAdvertised(ctx, cl) {
@@ -1506,12 +1514,16 @@ func execStatement(cf *connFlags, query string, plan []byte, output, encKey stri
 		if st.streamMs > 0 {
 			mbit = float64(wire) * 8 / 1e6 / (float64(st.streamMs) / 1000)
 		}
+		planLabel := "plan (GetFlightInfo)"
+		if ticket != nil {
+			planLabel = "plan (skipped: 1-RTT)"
+		}
 		fmt.Fprintf(os.Stderr, `── query stats ─────────────────────────
-plan (GetFlightInfo)  %6d ms
+%s %6d ms
 first byte            %6d ms
 stream (DoGet)        %6d ms
 total                 %6d ms
-`, planMs, st.firstMs, st.streamMs, time.Since(t0).Milliseconds())
+`, fmt.Sprintf("%-21s", planLabel), planMs, st.firstMs, st.streamMs, time.Since(t0).Milliseconds())
 
 		rowsLine := fmt.Sprintf("rows       %s in %d batches", groupDigits(fmt.Sprint(total)), st.batches)
 		if len(st.rowsPerBatch) > 1 {
@@ -2608,6 +2620,7 @@ usage:
   sparrow sql --substrait plan.pb                 execute a serialized Substrait plan
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow head <table> [n]                        preview the first n rows (default 10)
+  sparrow doget '<ticket>'                         1-RTT pull: raw ticket straight to DoGet (no GetFlightInfo)
   sparrow profile <table> [-o json]               per-column nulls · distinct · min · max
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
@@ -2652,6 +2665,8 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "head":
 		err = cmdHead(os.Args[2:])
+	case "doget":
+		err = cmdDoGet(os.Args[2:])
 	case "profile":
 		err = cmdProfile(os.Args[2:])
 	case "check":
@@ -2690,6 +2705,8 @@ func main() {
 				err = cmdQuery([]string{"-h"})
 			case "head":
 				err = cmdHead([]string{"-h"})
+			case "doget":
+				err = cmdDoGet([]string{"-h"})
 			case "profile":
 				err = cmdProfile([]string{"-h"})
 			case "check":

@@ -25,6 +25,7 @@ var cmdDesc = map[string]string{
 	"sql":        "run a Flight SQL statement",
 	"query":      "build and run a simple SELECT",
 	"head":       "preview the first n rows of a table",
+	"doget":      "1-RTT pull: raw ticket straight to DoGet",
 	"profile":    "per-column null/distinct/min/max profile",
 	"doctor":     "layered connection diagnosis",
 	"check":      "data-quality checks on a table",
@@ -47,6 +48,7 @@ var cmdOwnFlags = map[string][]string{
 	"sql":        {"f", "substrait", "o", "max-rows", "encrypt-key", "stats", "ipc", "schema", "bigint-as-string"},
 	"query":      {"cols", "where", "order", "desc", "limit", "o", "max-rows", "encrypt-key", "stats", "ipc", "bigint-as-string"},
 	"head":       {"o"},
+	"doget":      {"o", "encrypt-key", "max-rows", "stats", "ipc", "bigint-as-string"},
 	"profile":    {"o"},
 	"doctor":     {"o", "server"},
 	"check":      {"key", "time", "value", "max-age", "strict", "show-violations", "approx", "explain", "baseline", "o"},
@@ -63,7 +65,7 @@ var cmdOwnFlags = map[string][]string{
 // serverCmds get the shared connection flags in addition to their own
 var serverCmds = map[string]bool{
 	"connect": true, "orient": true, "ls": true, "info": true, "sql": true,
-	"query": true, "head": true, "profile": true, "doctor": true, "check": true,
+	"query": true, "head": true, "doget": true, "profile": true, "doctor": true, "check": true,
 	"diff": true, "audit": true, "ping": true,
 }
 
