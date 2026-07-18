@@ -48,7 +48,7 @@ import (
 )
 
 // version is stamped by goreleaser (-X main.version={{.Version}}) on releases
-var version = "0.16.0-dev"
+var version = "0.17.0-dev"
 
 // versionString falls back to the Go module version for `go install` builds,
 // which don't get the ldflags stamp.
