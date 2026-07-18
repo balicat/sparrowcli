@@ -2620,7 +2620,7 @@ usage:
   sparrow sql --substrait plan.pb                 execute a serialized Substrait plan
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow head <table> [n]                        preview the first n rows (default 10)
-  sparrow doget '<ticket>'                         1-RTT pull: raw ticket straight to DoGet (no GetFlightInfo)
+  sparrow pull '<ticket>'                          Direct Pull (1-RTT): a ready ticket straight to the server, no GetFlightInfo
   sparrow profile <table> [-o json]               per-column nulls · distinct · min · max
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
@@ -2665,8 +2665,8 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "head":
 		err = cmdHead(os.Args[2:])
-	case "doget":
-		err = cmdDoGet(os.Args[2:])
+	case "pull", "doget": // "doget" = hidden alias (the DoGet RPC name)
+		err = cmdPull(os.Args[2:])
 	case "profile":
 		err = cmdProfile(os.Args[2:])
 	case "check":
@@ -2705,8 +2705,8 @@ func main() {
 				err = cmdQuery([]string{"-h"})
 			case "head":
 				err = cmdHead([]string{"-h"})
-			case "doget":
-				err = cmdDoGet([]string{"-h"})
+			case "pull", "doget":
+				err = cmdPull([]string{"-h"})
 			case "profile":
 				err = cmdProfile([]string{"-h"})
 			case "check":

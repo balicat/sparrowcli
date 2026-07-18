@@ -129,27 +129,29 @@ examples: sparrow head series_data · sparrow head trades 20 -o md`)
 	return execStatement(cf, q, nil, nil, *output, "", n, false, false, false)
 }
 
-// cmdDoGet — the 1-RTT pull: a raw ticket straight to DoGet, no
+// cmdPull — a Direct Pull (1-RTT): a ready ticket straight to DoGet, no
 // GetFlightInfo, no SQL. Flight SQL reads are two round trips by design
 // (query → ticket → stream); servers that accept client-constructed tickets
 // serve known pulls in ONE. Measured on the public demo: 143 ms vs 224 ms
-// for the same 10k-row series.
-func cmdDoGet(args []string) error {
-	fs := newFlagSet("doget", `usage: sparrow doget '<ticket>' [flags]
-1-RTT pull: send a raw ticket STRAIGHT to DoGet — skipping GetFlightInfo
-(and SQL entirely). Ticket dialects are server-specific; Sparrow serving
-nodes accept JSON: {"series": ["ID", ...], "start": "...", "end": "..."}.
+// for the same 10k-row series. Invoked as `sparrow pull`; `doget` (the DoGet
+// RPC name) is kept as a hidden alias.
+func cmdPull(args []string) error {
+	fs := newFlagSet("pull", `usage: sparrow pull '<ticket>' [flags]
+Direct Pull (1-RTT): send a ready ticket STRAIGHT to the server (DoGet),
+skipping GetFlightInfo and SQL entirely. Ticket dialects are server-specific;
+Sparrow serving nodes accept JSON: {"series": ["ID", ...], "start": "...",
+"end": "..."} — or {"sql": "SELECT …"} for an arbitrary read-only query.
 Servers that mint opaque statement handles (GizmoSQL, DataFusion) reject
-raw tickets — use sparrow sql there. doctor --server probes which kind a
+ready tickets — use sparrow sql there. doctor --server probes which kind a
 server is ("direct JSON tickets").
 By default a Sparrow ticket also requests lz4 compression (the server
 compresses only if it offers it; arrow-go decodes transparently and --stats
 reports the codec + ratio). Pass --accept-compression "" to send verbatim.
-examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
-          sparrow doget '{"series": ["FRED.DFF"], "start": "2020-01-01"}' -o md
-          sparrow doget @ticket.json -o data.parquet
-          sparrow doget '{"sql": "SELECT …"}' --stats   # wire line shows codec lz4_frame
-          echo '{"series": ["PET.RWTC.D"]}' | sparrow doget - --stats`)
+examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
+          sparrow pull '{"series": ["FRED.DFF"], "start": "2020-01-01"}' -o md
+          sparrow pull @ticket.json -o data.parquet
+          sparrow pull '{"sql": "SELECT …"}' --stats   # wire line shows codec lz4_frame
+          echo '{"series": ["PET.RWTC.D"]}' | sparrow pull - --stats`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path")
 	encKey := fs.String("encrypt-key", "", "seal parquet output: hex key, env:VAR, or file:path")
@@ -161,7 +163,7 @@ examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
 		"codecs to request on a Sparrow ticket (comma list); the server compresses only for a listed one and arrow-go decodes it transparently. \"\"|none to send the ticket verbatim")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
-		return usagef("usage: sparrow doget '<ticket>' (or @file, or - for stdin)")
+		return usagef("usage: sparrow pull '<ticket>' (or @file, or - for stdin)")
 	}
 	raw := pos[0]
 	var ticket []byte
@@ -182,7 +184,7 @@ examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
 		ticket = []byte(raw)
 	}
 	if len(ticket) == 0 {
-		return usagef("doget: empty ticket")
+		return usagef("pull: empty ticket")
 	}
 	ticket = withAcceptCompression(ticket, *acceptComp)
 	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)

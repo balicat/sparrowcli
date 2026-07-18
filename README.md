@@ -35,7 +35,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
-| `sparrow doget '<ticket>'` | **1-RTT pull**: a raw ticket straight to `DoGet` — no `GetFlightInfo`, no SQL. Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `doctor --server` probes which kind a server is | `DoGet` only |
+| `sparrow pull '<ticket>'` | **Direct Pull (1-RTT)**: a ready ticket straight to the server — no `GetFlightInfo`, no SQL (`doget` is a hidden alias). Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `doctor --server` probes which kind a server is | `DoGet` only |
 | `sparrow profile <table>` | per-column nulls %, approx-distinct, min, max — one server-side pass | one aggregate query |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) — 10 surface probes incl. IPC compression) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
@@ -59,17 +59,23 @@ self-signed. The CLI identifies the server by trying `GetSqlInfo` first, then
 `SELECT version()` as a fallback — Dremio answers the second, InfluxDB the
 first; between them, every server identifies itself.
 
-## One round trip — `doget`
+## Direct Pull (1 RTT) — `pull`
 
 A Flight SQL read is two round trips by design: `GetFlightInfo` to plan, then
-`DoGet` to stream. When you already know what you want, `doget` sends a
-client-constructed ticket straight to `DoGet` and skips the plan. Sparrow
-serving nodes accept a JSON ticket in either of two dialects:
+`DoGet` to stream. A **Direct Pull** sends a client-made ticket straight to the
+server and skips the plan — one round trip. The same WTI crude series, fetched
+both ways — an ordinary query the server plans, and a Direct Pull:
 
 ```sh
-# a known series, by key
-sparrow doget '{"series":["PET.RWTC.D"]}' -o table --max-rows 5
+# the ordinary way — a query the server plans (2 round trips)
+sparrow sql "SELECT series_id, period, value FROM series_data WHERE series_id='PET.RWTC.D' ORDER BY period" -o table --max-rows 5
+
+# a Direct Pull — a ready ticket straight to the server (1 round trip)
+sparrow pull '{"series":["PET.RWTC.D"]}' -o table --max-rows 5
 ```
+
+Both print the identical rows:
+
 ```
 series_id   period    value
 PET.RWTC.D  19860102  25.56
@@ -79,9 +85,11 @@ PET.RWTC.D  19860107  25.85
 PET.RWTC.D  19860108  25.87
 ```
 
+A ticket comes in two dialects — `{"series":[…]}` by key, or `{"sql":"…"}` for
+an arbitrary read-only query:
+
 ```sh
-# an arbitrary read-only query, carried in the ticket itself
-sparrow doget '{"sql":"SELECT series_id, COUNT(*) AS n FROM series_data GROUP BY 1 ORDER BY n DESC LIMIT 3"}' -o table
+sparrow pull '{"sql":"SELECT series_id, COUNT(*) AS n FROM series_data GROUP BY 1 ORDER BY n DESC LIMIT 3"}' -o table
 ```
 ```
 series_id                      n
@@ -94,8 +102,10 @@ Default output is raw Arrow IPC when piped — so it composes (`| duckdb`,
 `> series.arrows`) — and an aligned table on a TTY; `-o` picks explicitly.
 `--stats` shows the round trip you skipped (`plan (skipped: 1-RTT)`) and the
 codec you negotiated (see [Measure](#measure--is-it-the-network-or-the-server)).
-Opaque-handle vendors — most Flight SQL servers — don't accept client tickets;
-use `sql` there, and `sparrow doctor --server` probes which kind a server is.
+`pull` is the same operation as the Flight `DoGet` RPC — which is why `doget`
+still works as a hidden alias. Opaque-handle vendors — most Flight SQL servers —
+don't accept client tickets; use `sql` there, and `sparrow doctor --server`
+probes which kind a server is.
 
 ## Output — pick your consumer
 
@@ -235,9 +245,9 @@ Prefer the raw view? `sql --ipc` prints the message-by-message IPC manifest
 instead: type, rows, body bytes, declared codec, custom metadata.
 
 The example above reads `no body compression declared` because a `sql` query
-is a 2-RTT pull — the opaque statement ticket can't negotiate a codec. To
-*request* a compressed wire, use a 1-RTT `doget` (Sparrow serving nodes accept
-JSON tickets): `sparrow doget '{"series":["…"]}' --accept-compression lz4` (lz4
+is a 2-RTT read — the opaque statement ticket can't negotiate a codec. To
+*request* a compressed wire, use a Direct Pull (Sparrow serving nodes accept
+JSON tickets): `sparrow pull '{"series":["…"]}' --accept-compression lz4` (lz4
 is on by default; `--accept-compression ""` opts out). A negotiating server
 compresses only for a codec the client lists, `arrow-go` decodes it
 transparently, and the same `--stats`/`--ipc` view then prints `codec
@@ -245,7 +255,7 @@ lz4_frame` with the ratio. `sparrow doctor --server` probes whether a server
 offers it at all.
 
 ```
-$ sparrow doget '{"series":["PET.RWTC.D"]}' --stats > /dev/null
+$ sparrow pull '{"series":["PET.RWTC.D"]}' --stats > /dev/null
 plan (skipped: 1-RTT)      0 ms
 rows       10,217 in 5 batches · rows/batch p50 2,048
 wire       172.5 KB received · decodes to 347.4 KB (2.0×) · codec lz4_frame

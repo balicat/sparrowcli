@@ -173,14 +173,14 @@ func runConform(cf *connFlags, jsonOut bool) error {
 		rdr, err := cl.DoGet(ctx, tk)
 		if err != nil {
 			if strings.Contains(err.Error(), sentinel) {
-				return "JSON tickets parsed (probe id unknown, as expected) — `sparrow doget` works here", nil
+				return "JSON tickets parsed (probe id unknown, as expected) — `sparrow pull` works here", nil
 			}
 			return "", fmt.Errorf("Sparrow-dialect ticket not accepted — the server may still take its own JSON dialect (IOx does); 2-RTT SQL (`sparrow sql`) is the portable path")
 		}
 		for rdr.Next() {
 		}
 		rdr.Release()
-		return "accepted (clean empty result for an unknown id) — `sparrow doget` works here", nil
+		return "accepted (clean empty result for an unknown id) — `sparrow pull` works here", nil
 	})
 
 	// Does the server ship COMPRESSED IPC when the client asks? The high-level
@@ -208,7 +208,7 @@ func runConform(cf *connFlags, jsonOut bool) error {
 					return "not offered — server sent uncompressed even when asked (compression off or accept_compression ignored)", nil
 				}
 				return "offered — server compresses on request; codec " + codec +
-					" (arrow-go/pyarrow/sparrowJS ≥0.5 decode it; `sparrow doget` requests lz4 by default)", nil
+					" (arrow-go/pyarrow/sparrowJS ≥0.5 decode it; `sparrow pull` requests lz4 by default)", nil
 			}
 		}
 		return "no record batch returned to inspect", nil
