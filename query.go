@@ -3,12 +3,54 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// withAcceptCompression augments a Sparrow-dialect JSON ticket with the codecs
+// this client can decode, so a negotiating server ships a smaller wire (arrow-go
+// decompresses lz4 transparently). Left untouched — safe — when: codecs is empty
+// ("" / none / off), the ticket isn't a JSON object (bare id, other dialects),
+// it already declares accept_compression, or it carries no Sparrow key
+// (series/sql) so we don't perturb another vendor's dialect.
+func withAcceptCompression(ticket []byte, codecs string) []byte {
+	var list []string
+	for _, c := range strings.Split(codecs, ",") {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if c != "" && c != "none" && c != "off" {
+			list = append(list, c)
+		}
+	}
+	if len(list) == 0 {
+		return ticket
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(ticket, &m) != nil {
+		return ticket // not a JSON object
+	}
+	if _, has := m["accept_compression"]; has {
+		return ticket // caller set it explicitly
+	}
+	_, hasSeries := m["series"]
+	_, hasSQL := m["sql"]
+	if !hasSeries && !hasSQL {
+		return ticket // not a Sparrow-dialect ticket — don't touch it
+	}
+	enc, err := json.Marshal(list)
+	if err != nil {
+		return ticket
+	}
+	m["accept_compression"] = enc
+	out, err := json.Marshal(m)
+	if err != nil {
+		return ticket
+	}
+	return out
+}
 
 func cmdQuery(args []string) error {
 	fs := newFlagSet("query", `usage: sparrow query <table> [flags]
@@ -100,9 +142,13 @@ nodes accept JSON: {"series": ["ID", ...], "start": "...", "end": "..."}.
 Servers that mint opaque statement handles (GizmoSQL, DataFusion) reject
 raw tickets — use sparrow sql there. doctor --server probes which kind a
 server is ("direct JSON tickets").
+By default a Sparrow ticket also requests lz4 compression (the server
+compresses only if it offers it; arrow-go decodes transparently and --stats
+reports the codec + ratio). Pass --accept-compression "" to send verbatim.
 examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
           sparrow doget '{"series": ["FRED.DFF"], "start": "2020-01-01"}' -o md
           sparrow doget @ticket.json -o data.parquet
+          sparrow doget '{"sql": "SELECT …"}' --stats   # wire line shows codec lz4_frame
           echo '{"series": ["PET.RWTC.D"]}' | sparrow doget - --stats`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path")
@@ -111,6 +157,8 @@ examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
 	statsOn := fs.Bool("stats", false, "print stream anatomy to stderr")
 	ipcOn := fs.Bool("ipc", false, "print the raw IPC manifest to stderr")
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64 as quoted strings in JSON output")
+	acceptComp := fs.String("accept-compression", "lz4",
+		"codecs to request on a Sparrow ticket (comma list); the server compresses only for a listed one and arrow-go decodes it transparently. \"\"|none to send the ticket verbatim")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef("usage: sparrow doget '<ticket>' (or @file, or - for stdin)")
@@ -136,5 +184,6 @@ examples: sparrow doget '{"series": ["PET.RWTC.D"]}'
 	if len(ticket) == 0 {
 		return usagef("doget: empty ticket")
 	}
+	ticket = withAcceptCompression(ticket, *acceptComp)
 	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
 }
