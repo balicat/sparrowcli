@@ -159,12 +159,15 @@ func runConform(cf *connFlags, jsonOut bool) error {
 	})
 
 	// 1-RTT check: does the server accept a CLIENT-CONSTRUCTED JSON ticket
-	// on DoGet (Sparrow-style {"series": [...]})? If so, known pulls can
-	// skip GetFlightInfo entirely — one round trip instead of two
-	// (`sparrow doget`). A clean stream (even empty) OR an error that echoes
-	// the probe id both mean the JSON dialect was PARSED; an opaque-handle
-	// error means it wasn't.
-	run("direct JSON tickets (1-RTT)", func() (string, error) {
+	// on DoGet in the SPARROW dialect ({"series": [...]})? If so, known
+	// pulls can skip GetFlightInfo entirely — one round trip instead of
+	// two (`sparrow doget`). A clean stream (even empty) OR an error that
+	// echoes the probe id both mean the dialect was PARSED. A rejection
+	// only means THIS dialect wasn't understood — the server may still
+	// accept its own (InfluxDB IOx takes {"database","sql_query",…});
+	// tester S4 2026-07-17: don't claim "opaque handles only" on that
+	// evidence.
+	run("direct JSON tickets (Sparrow dialect)", func() (string, error) {
 		const sentinel = "__sparrow_conform_probe__"
 		tk := &flight.Ticket{Ticket: []byte(`{"series": ["` + sentinel + `"]}`)}
 		rdr, err := cl.DoGet(ctx, tk)
@@ -172,7 +175,7 @@ func runConform(cf *connFlags, jsonOut bool) error {
 			if strings.Contains(err.Error(), sentinel) {
 				return "JSON tickets parsed (probe id unknown, as expected) — `sparrow doget` works here", nil
 			}
-			return "", fmt.Errorf("opaque statement handles only — 2-RTT SQL (`sparrow sql`)")
+			return "", fmt.Errorf("Sparrow-dialect ticket not accepted — the server may still take its own JSON dialect (IOx does); 2-RTT SQL (`sparrow sql`) is the portable path")
 		}
 		for rdr.Next() {
 		}
