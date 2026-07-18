@@ -35,9 +35,9 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
-| `sparrow doget '<ticket>'` | **1-RTT pull**: a raw ticket straight to `DoGet` — no `GetFlightInfo`, no SQL. Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series. `doctor --server` probes which kind a server is | `DoGet` only |
+| `sparrow doget '<ticket>'` | **1-RTT pull**: a raw ticket straight to `DoGet` — no `GetFlightInfo`, no SQL. Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series. `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `doctor --server` probes which kind a server is | `DoGet` only |
 | `sparrow profile <table>` | per-column nulls %, approx-distinct, min, max — one server-side pass | one aggregate query |
-| `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) instead) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
+| `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) — 10 surface probes incl. IPC compression) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper. Exit 1 if exposed | benign probes; run against a server you operate |
@@ -195,6 +195,16 @@ name themselves.
 
 Prefer the raw view? `sql --ipc` prints the message-by-message IPC manifest
 instead: type, rows, body bytes, declared codec, custom metadata.
+
+The example above reads `no body compression declared` because a `sql` query
+is a 2-RTT pull — the opaque statement ticket can't negotiate a codec. To
+*request* a compressed wire, use a 1-RTT `doget` (Sparrow serving nodes accept
+JSON tickets): `sparrow doget '{"series":["…"]}' --accept-compression lz4` (lz4
+is on by default; `--accept-compression ""` opts out). A negotiating server
+compresses only for a codec the client lists, `arrow-go` decodes it
+transparently, and the same `--stats`/`--ipc` view then prints `codec
+lz4_frame` with the ratio. `sparrow doctor --server` probes whether a server
+offers it at all.
 
 Stats go to stderr, so they compose with every output format and pipe.
 Every benchmark number this project publishes is reproducible with this flag.
