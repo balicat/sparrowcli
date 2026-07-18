@@ -328,12 +328,23 @@ sparrow orient
 Then query with results the agent reads natively:
 
 ```sh
-sparrow info series_data                  # row count for one table
-sparrow sql "SELECT ... LIMIT 20" -o md   # readable results
-echo "SELECT ..." | sparrow sql - -o md   # SQL via stdin — no shell-quoting battles
+sparrow info series_data                          # row count for one table
+sparrow sql "SELECT ... LIMIT 20" -o md           # arbitrary query, readable results
+echo "SELECT ..." | sparrow sql - -o md           # SQL via stdin — no shell-quoting battles
+sparrow pull '{"series":["PET.RWTC.D"]}' -o md     # a known series in ONE round trip
 ```
 
 Conventions agents can rely on:
+
+- **Two ways to read the same data.** `sparrow sql "<query>"` plans an
+  arbitrary query — two round trips (`GetFlightInfo` then `DoGet`). When you
+  already know exactly what you want, `sparrow pull '<ticket>'` sends a ready
+  ticket straight to the server in **one** round trip: a `{"series":[…]}` key
+  or a `{"sql":"…"}` string, lz4-compressed by default. `sparrow help pull`
+  prints the ticket dialects; the server also advertises them in-band via
+  `GetSqlInfo`. Opaque-handle vendors reject client tickets — use `sql` there
+  (`sparrow doctor --server` says which kind a server is). Rule of thumb:
+  **exploring → `sql`; a known series or a fixed query you'll repeat → `pull`.**
 
 - `-o md` / `-o jsonl` / `-o csv` are stable, parseable stdout formats — no
   ANSI, no decoration; row-count and timing summaries go to **stderr**.
