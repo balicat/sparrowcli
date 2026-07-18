@@ -2164,8 +2164,9 @@ staged diagnosis of a Flight SQL endpoint: config → dns → tcp → tls → au
 flight sql → round trip. Names the layer that breaks and shows what the wire
 actually presented (TLS version, ALPN, certificate chain).
 --server swaps the connection diagnosis for a CONFORMANCE CARD: which Flight
-SQL surfaces (GetSqlInfo, catalog RPCs, prepared statements, actions) the
-server implements — informational, always exit 0 once the dial works.
+SQL surfaces (GetSqlInfo, catalog RPCs, prepared statements, actions, direct
+JSON tickets, IPC compression) the server implements — informational, always
+exit 0 once the dial works.
 examples: sparrow doctor · sparrow doctor -s influx -o json · sparrow doctor --server`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", `output: "json" for a machine-readable report`)
