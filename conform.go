@@ -183,6 +183,37 @@ func runConform(cf *connFlags, jsonOut bool) error {
 		return "accepted (clean empty result for an unknown id) — `sparrow doget` works here", nil
 	})
 
+	// Does the server ship COMPRESSED IPC when the client asks? The high-level
+	// reader decompresses transparently and hides the codec, so read the raw
+	// FlightData record-batch header and pull the BodyCompression codec
+	// (reusing ipcCodec, same field --stats reports). Needs a row-returning
+	// result — empty streams carry no record batch — so probe the sql template
+	// with a SELECT 1 carrying accept_compression. n/a on servers without it.
+	run("IPC compression (when requested)", func() (string, error) {
+		tk := &flight.Ticket{Ticket: []byte(`{"sql":"SELECT 1 AS n","accept_compression":["lz4"]}`)}
+		stream, err := cl.Client.DoGet(ctx, tk)
+		if err != nil {
+			return "", fmt.Errorf("not probed — needs the sql direct-ticket template: %v", err)
+		}
+		for {
+			fd, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return "", fmt.Errorf("not probed — sql ticket rejected: %v", err)
+			}
+			if codec, isBatch := ipcCodec(fd.DataHeader); isBatch {
+				if codec == "" {
+					return "not offered — server sent uncompressed even when asked (compression off or accept_compression ignored)", nil
+				}
+				return "offered — server compresses on request; codec " + codec +
+					" (arrow-go/pyarrow/sparrowJS ≥0.5 decode it; `sparrow doget` requests lz4 by default)", nil
+			}
+		}
+		return "no record batch returned to inspect", nil
+	})
+
 	run("GetCatalogs", func() (string, error) {
 		info, err := cl.GetCatalogs(ctx)
 		if err != nil {
