@@ -59,6 +59,44 @@ self-signed. The CLI identifies the server by trying `GetSqlInfo` first, then
 `SELECT version()` as a fallback — Dremio answers the second, InfluxDB the
 first; between them, every server identifies itself.
 
+## One round trip — `doget`
+
+A Flight SQL read is two round trips by design: `GetFlightInfo` to plan, then
+`DoGet` to stream. When you already know what you want, `doget` sends a
+client-constructed ticket straight to `DoGet` and skips the plan. Sparrow
+serving nodes accept a JSON ticket in either of two dialects:
+
+```sh
+# a known series, by key
+sparrow doget '{"series":["PET.RWTC.D"]}' -o table --max-rows 5
+```
+```
+series_id   period    value
+PET.RWTC.D  19860102  25.56
+PET.RWTC.D  19860103  26
+PET.RWTC.D  19860106  26.53
+PET.RWTC.D  19860107  25.85
+PET.RWTC.D  19860108  25.87
+```
+
+```sh
+# an arbitrary read-only query, carried in the ticket itself
+sparrow doget '{"sql":"SELECT series_id, COUNT(*) AS n FROM series_data GROUP BY 1 ORDER BY n DESC LIMIT 3"}' -o table
+```
+```
+series_id                      n
+FRED.DFF                       13340
+PET.EER_EPD2F_PE3_Y35NY_DPG.D  11117
+PET.EER_EPD2F_PE1_Y35NY_DPG.D  11113
+```
+
+Default output is raw Arrow IPC when piped — so it composes (`| duckdb`,
+`> series.arrows`) — and an aligned table on a TTY; `-o` picks explicitly.
+`--stats` shows the round trip you skipped (`plan (skipped: 1-RTT)`) and the
+codec you negotiated (see [Measure](#measure--is-it-the-network-or-the-server)).
+Opaque-handle vendors — most Flight SQL servers — don't accept client tickets;
+use `sql` there, and `sparrow doctor --server` probes which kind a server is.
+
 ## Output — pick your consumer
 
 ```sh
