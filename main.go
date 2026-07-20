@@ -1803,8 +1803,17 @@ example: sparrow orient -s gizmo`)
 			}
 			fmt.Printf("| %s | %s | %s |\n", f.Name, f.Type, null)
 		}
+		// A MACRO is a function, not a table — a bare SELECT * FROM it
+		// errors. Teach the call shape right where it's discovered (the
+		// generic "SELECT ... LIMIT 20" footer would mislead here).
+		if strings.EqualFold(t.typ, "MACRO") {
+			fmt.Printf("\na table macro — CALL it with arguments: `SELECT * FROM %s('...')` "+
+				"(a bare `SELECT * FROM %s` errors; argument names: "+
+				"`SELECT parameters FROM duckdb_functions() WHERE function_name='%s'`)\n",
+				t.name, t.name, t.name)
+		}
 	}
-	fmt.Println("\nnext: `sparrow info <table>` for a row count · `sparrow sql \"SELECT ... LIMIT 20\" -o md` to look at data")
+	fmt.Println("\nnext: `sparrow info <table>` for a row count · `sparrow sql \"SELECT ... LIMIT 20\" -o md` to look at data (macros: call with args instead)")
 	return nil
 }
 
@@ -1858,6 +1867,7 @@ example: sparrow info series_data`)
 		return err
 	}
 	found := false
+	isMacro := false
 	var schema *arrow.Schema
 	for _, ep := range info.Endpoint {
 		rdr, err := cl.DoGet(ctx, ep.Ticket)
@@ -1878,7 +1888,11 @@ example: sparrow info series_data`)
 				}
 				fmt.Printf("table: %s", name)
 				if i, ok := idx["table_type"]; ok {
-					fmt.Printf(" (%s)", cell(rec.Column(i), r))
+					typ := cell(rec.Column(i), r)
+					fmt.Printf(" (%s)", typ)
+					if strings.EqualFold(typ, "MACRO") {
+						isMacro = true
+					}
 				}
 				fmt.Println()
 				cat, sch := "", ""
@@ -1938,6 +1952,14 @@ example: sparrow info series_data`)
 			fmt.Fprintf(w, "  %s\t%s\t%s\n", f.Name, f.Type, null)
 		}
 		w.Flush()
+	}
+	if isMacro {
+		// A macro is a function, not a table: no row count to take, and a
+		// bare SELECT * FROM it errors — print the call shape instead.
+		fmt.Printf("a table macro — call it with arguments: SELECT * FROM %s('...')\n"+
+			"argument names: SELECT parameters FROM duckdb_functions() WHERE function_name='%s'\n",
+			table, table)
+		return nil
 	}
 	if !*noCount {
 		if info, err := cl.Execute(ctx, "SELECT COUNT(*) FROM "+table); err == nil {

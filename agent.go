@@ -143,6 +143,8 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 
 Connection flags work on every server command: ` + "`-s <profile|uri>`" + `,
 ` + "`--basic user:pass`" + `, ` + "`--bearer TOKEN`" + `, ` + "`--header k=v`" + `, ` + "`--tls-ca/--tls-cert/--tls-key`" + `.
+(` + "`ticket`" + `, ` + "`agent`" + `, ` + "`profiles`" + ` and ` + "`completion`" + ` are client-side only — they
+take NO connection flags; passing ` + "`-s`" + ` there is a usage error.)
 Per-command help: ` + "`sparrow help <command>`" + ` or ` + "`sparrow <command> -h`" + `.
 
 ## A typical flow

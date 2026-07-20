@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"strings"
 )
@@ -32,9 +33,18 @@ examples:
 	pretty := fs.Bool("pretty", false, "pretty-print the JSON")
 	pos := parseFlags(fs, args)
 
+	// Tester M2: `--series ""` should get the specific at-least-one-id error,
+	// not the generic usage — branch on the flag being SET, not non-empty.
+	seriesSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "series" {
+			seriesSet = true
+		}
+	})
+
 	tk := map[string]any{}
 	switch {
-	case *series != "":
+	case seriesSet:
 		if len(pos) > 0 {
 			return usagef("ticket: give a SQL string OR --series, not both")
 		}
@@ -55,6 +65,12 @@ examples:
 			tk["end"] = *end
 		}
 	case len(pos) == 1:
+		// Tester T1 (2026-07-20): --start/--end were silently DROPPED on a
+		// sql ticket — an agent setting a bound got unbounded data. Refuse
+		// loudly instead; bounds for a sql ticket belong in the SQL itself.
+		if *start != "" || *end != "" {
+			return usagef("ticket: --start/--end apply to --series tickets only — put bounds for a sql ticket in the SQL (WHERE …)")
+		}
 		q := strings.TrimSpace(pos[0])
 		if q == "" {
 			return usagef("ticket: empty SQL")
