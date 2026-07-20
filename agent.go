@@ -56,6 +56,16 @@ whole catalog in one shot. Do it before guessing table or column names.
 
 **Rule of thumb: exploring → ` + "`sql`" + ` · a known series or a fixed repeated query → ` + "`pull`" + `.**
 
+**Reusable tickets.** A ticket is a plain, stateless artifact — the server
+re-runs it fresh every ` + "`pull`" + `, so you can save one and replay it forever (it
+even survives a server restart; a GetFlightInfo statement handle does NOT — it's
+single-use). ` + "`sparrow ticket`" + ` writes one for you, JSON-escaped:
+` + "```sh" + `
+sparrow ticket "SELECT period, value FROM series_data WHERE series_id='PET.RWTC.D'" > wti.ticket
+sparrow pull @wti.ticket -o md          # replay it, as often as you like — 1 RTT each
+` + "```" + `
+(` + "`sparrow ticket --series A,B [--start ..]`" + ` builds a series ticket instead.)
+
 ## Output — built for programmatic reading
 
 - ` + "`-o md`" + ` / ` + "`-o jsonl`" + ` / ` + "`-o csv`" + ` — **stable, parseable stdout**: no ANSI, no
@@ -120,6 +130,7 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`query <table>`" + ` | build a simple SELECT (` + "`--where --order --limit`" + `) |
 | ` + "`head <table> [n]`" + ` | preview first n rows |
 | ` + "`pull '<ticket>'`" + ` | Direct Pull (1-RTT); ` + "`doget`" + ` is a hidden alias |
+| ` + "`ticket \"<sql>\"`" + ` | emit a reusable pull ticket (JSON) to save & replay |
 | ` + "`profile <table>`" + ` | per-column null/distinct/min/max |
 | ` + "`doctor [--server]`" + ` | connection diagnosis; ` + "`--server`" + ` = Flight SQL conformance card |
 | ` + "`check <table>`" + ` | data-quality gate (exit 1 on findings) |

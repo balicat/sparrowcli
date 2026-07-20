@@ -2622,6 +2622,7 @@ usage:
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)
   sparrow head <table> [n]                        preview the first n rows (default 10)
   sparrow pull '<ticket>'                          Direct Pull (1-RTT): a ready ticket straight to the server, no GetFlightInfo
+  sparrow ticket "<sql>" | --series a,b            emit a reusable pull ticket (JSON) to save and replay with pull @file
   sparrow profile <table> [-o json]               per-column nulls · distinct · min · max
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
@@ -2689,6 +2690,8 @@ func main() {
 		err = cmdCompletion(os.Args[2:])
 	case "agent":
 		err = cmdAgent(os.Args[2:])
+	case "ticket":
+		err = cmdTicket(os.Args[2:])
 	case "version":
 		fmt.Println("sparrow", versionString())
 	case "help", "-h", "--help":
@@ -2729,6 +2732,8 @@ func main() {
 				err = cmdCompletion([]string{"-h"})
 			case "agent":
 				err = cmdAgent([]string{"-h"})
+			case "ticket":
+				err = cmdTicket([]string{"-h"})
 			case "profiles":
 				fmt.Println("usage: sparrow profiles              list saved connections (* = default) — or: sparrow agent (agent guide)")
 				fmt.Println("       sparrow profiles use <name>   set the default profile")

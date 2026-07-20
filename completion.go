@@ -36,6 +36,7 @@ var cmdDesc = map[string]string{
 	"profiles":   "list / use / rm saved profiles",
 	"completion": "print a shell completion script",
 	"agent":      "print a complete agent-ready manual (markdown)",
+	"ticket":     "emit a reusable pull ticket (JSON) to save and replay",
 	"version":    "print version",
 	"help":       "help for a command",
 }
@@ -60,6 +61,7 @@ var cmdOwnFlags = map[string][]string{
 	"profiles":   {},
 	"completion": {},
 	"agent":      {},
+	"ticket":     {"series", "start", "end", "pretty"},
 	"version":    {},
 	"help":       {},
 }

@@ -36,6 +36,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
 | `sparrow pull '<ticket>'` | **Direct Pull (1-RTT)**: a ready ticket straight to the server — no `GetFlightInfo`, no SQL (`doget` is a hidden alias). Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `doctor --server` probes which kind a server is | `DoGet` only |
+| `sparrow ticket '<sql>'` \| `--series a,b` | emit a **reusable** pull ticket (JSON) — save it, replay it forever with `pull @file`. A client ticket is stateless (re-run fresh each `pull`); a GetFlightInfo handle is single-use | none (client-side) |
 | `sparrow profile <table>` | per-column nulls %, approx-distinct, min, max — one server-side pass | one aggregate query |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) — 10 surface probes incl. IPC compression) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
@@ -106,6 +107,17 @@ codec you negotiated (see [Measure](#measure--is-it-the-network-or-the-server)).
 still works as a hidden alias. Opaque-handle vendors — most Flight SQL servers —
 don't accept client tickets; use `sql` there, and `sparrow doctor --server`
 probes which kind a server is.
+
+A client ticket is a **reusable, durable artifact** — the server re-runs it
+fresh on every `pull`, so save one and replay it forever (it survives restarts;
+a GetFlightInfo statement handle does not — that's single-use, consumed on its
+first `DoGet`). `sparrow ticket` writes one for you, JSON-escaped:
+
+```sh
+sparrow ticket "SELECT period, value FROM series_data WHERE series_id='PET.RWTC.D'" > wti.ticket
+sparrow pull @wti.ticket -o md          # replay it, 1 RTT each, as often as you like
+sparrow ticket --series PET.RWTC.D,FRED.DFF --start 2020-01-01 > two.ticket
+```
 
 ## Output — pick your consumer
 
