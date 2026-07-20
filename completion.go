@@ -29,6 +29,7 @@ var cmdDesc = map[string]string{
 	"profile":    "per-column null/distinct/min/max profile",
 	"doctor":     "layered connection diagnosis",
 	"check":      "data-quality checks on a table",
+	"expect":     "assert something about a query result (exit 1 on violation)",
 	"diff":       "compare a table across two servers",
 	"audit":      "security surface probe of a server you operate",
 	"ping":       "latency percentiles: bare TCP vs warm RPC",
@@ -54,6 +55,7 @@ var cmdOwnFlags = map[string][]string{
 	"profile":    {"o"},
 	"doctor":     {"o", "server"},
 	"check":      {"key", "time", "value", "max-age", "strict", "fail-on", "show-violations", "approx", "explain", "baseline", "o"},
+	"expect":     {"f", "eq", "ne", "gt", "lt", "ge", "le", "rows", "rows-min", "rows-max", "empty", "nonempty", "cols", "o"},
 	"diff":       {"against", "time", "o"},
 	"audit":      {"o"},
 	"ping":       {"n", "o"},
@@ -70,7 +72,7 @@ var cmdOwnFlags = map[string][]string{
 var serverCmds = map[string]bool{
 	"connect": true, "orient": true, "ls": true, "info": true, "sql": true,
 	"query": true, "head": true, "pull": true, "profile": true, "doctor": true, "check": true,
-	"diff": true, "audit": true, "ping": true,
+	"expect": true, "diff": true, "audit": true, "ping": true,
 }
 
 func completionCommands() []string {

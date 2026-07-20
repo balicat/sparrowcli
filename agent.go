@@ -193,6 +193,7 @@ sparrow ping -o json                       # network vs server latency, percenti
 sparrow sql "..." --stats                  # plan/first-byte/stream ms, wire bytes, codec, throughput (stderr)
 sparrow check <table> --key id -o json     # data health: nulls, dup keys, staleness; exit 1 = findings (gates CI)
 sparrow check <table> --fail-on keys       # gate the exit on named checks only; the rest still report
+sparrow expect "<sql>" --eq N              # assert a query result (--eq/--rows/--empty/--cols); exit 1 on violation — pin a finding as a contract
 sparrow audit -o json                      # what client SQL reaches beyond queries (files, SSRF, catalog writes) — a server you operate
 sparrow diff <t> --against <profile|uri>   # schema/count/bounds drift vs a second server; exit 1 = drift
 sparrow profile <table> -o json            # per-column nulls / approx-distinct / min / max, one server-side pass
@@ -214,6 +215,7 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`profile <table>`" + ` | per-column null/distinct/min/max |
 | ` + "`doctor [--server]`" + ` | connection diagnosis; ` + "`--server`" + ` = Flight SQL conformance card |
 | ` + "`check <table>`" + ` | data-quality gate (exit 1 on findings) |
+| ` + "`expect \"<sql>\"`" + ` | assert a query result (--eq/--rows/--empty/--cols); exit 1 on violation |
 | ` + "`diff <t> --against`" + ` | drift gate vs a second server |
 | ` + "`audit`" + ` | security surface of a server you operate |
 | ` + "`ping`" + ` | latency percentiles: network vs server |

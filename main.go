@@ -2649,6 +2649,7 @@ usage:
   sparrow doctor [-s profile] [-o json]           layered diagnosis: config→dns→tcp→tls→auth→sql
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
+  sparrow expect "<sql>" --eq N | --rows 0 | …     assert something about a query; exit 1 on violation (a data contract)
   sparrow diff <table> --against <profile|uri>    drift gate: schema·count·bounds vs a second server
   sparrow audit [-s profile] [-o json]            security surface: what client SQL can reach beyond queries
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
@@ -2696,6 +2697,8 @@ func main() {
 		err = cmdProfile(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "expect":
+		err = cmdExpect(os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
 	case "audit":
@@ -2740,6 +2743,8 @@ func main() {
 				err = cmdProfile([]string{"-h"})
 			case "check":
 				err = cmdCheck([]string{"-h"})
+			case "expect":
+				err = cmdExpect([]string{"-h"})
 			case "diff":
 				err = cmdDiff([]string{"-h"})
 			case "audit":
