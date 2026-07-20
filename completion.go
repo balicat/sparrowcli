@@ -35,6 +35,7 @@ var cmdDesc = map[string]string{
 	"feedback":   "send feedback to the sparrow maintainers",
 	"profiles":   "list / use / rm saved profiles",
 	"completion": "print a shell completion script",
+	"agent":      "print a complete agent-ready manual (markdown)",
 	"version":    "print version",
 	"help":       "help for a command",
 }
@@ -58,6 +59,7 @@ var cmdOwnFlags = map[string][]string{
 	"feedback":   {"category", "from"},
 	"profiles":   {},
 	"completion": {},
+	"agent":      {},
 	"version":    {},
 	"help":       {},
 }

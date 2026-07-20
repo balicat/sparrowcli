@@ -2632,6 +2632,7 @@ usage:
   sparrow feedback "message" [--category bug]     send feedback to the sparrow maintainers
   sparrow profiles [use <name> | rm <name>]
   sparrow completion bash|zsh|fish                shell tab-completion script
+  sparrow agent                                   print a complete agent-ready manual (markdown) for driving sparrow
   sparrow version
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
@@ -2686,6 +2687,8 @@ func main() {
 		err = cmdProfiles(os.Args[2:])
 	case "completion":
 		err = cmdCompletion(os.Args[2:])
+	case "agent":
+		err = cmdAgent(os.Args[2:])
 	case "version":
 		fmt.Println("sparrow", versionString())
 	case "help", "-h", "--help":
@@ -2724,8 +2727,10 @@ func main() {
 				err = cmdFeedback([]string{"-h"})
 			case "completion":
 				err = cmdCompletion([]string{"-h"})
+			case "agent":
+				err = cmdAgent([]string{"-h"})
 			case "profiles":
-				fmt.Println("usage: sparrow profiles              list saved connections (* = default)")
+				fmt.Println("usage: sparrow profiles              list saved connections (* = default) — or: sparrow agent (agent guide)")
 				fmt.Println("       sparrow profiles use <name>   set the default profile")
 				fmt.Println("       sparrow profiles rm <name>    remove a profile")
 			default:

@@ -318,6 +318,12 @@ GOOS=windows go build -o sparrow.exe .
 
 ## For AI agents (Claude Code, etc.)
 
+**`sparrow agent`** prints a complete, self-contained manual (markdown) for
+driving the CLI — every command, the `sql`-vs-`pull` decision, the output and
+exit-code conventions, how to call server-advertised macros like full-text
+search. Point an agent at it once (`sparrow agent > SPARROW.md`) and it can
+operate the tool with no other docs. The rest of this section is the summary.
+
 AI agents don't need a Flight client library — they can just call the CLI.
 **One command maps a Flight server** — vendor, tables, schemas, as markdown:
 
