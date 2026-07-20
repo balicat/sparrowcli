@@ -277,6 +277,7 @@ examples: sparrow check series_data --key series_id --time period
 	valueF := fs.String("value", "", "value column for the frozen-series check (default: the sole numeric column)")
 	maxAgeF := fs.String("max-age", "", `warn when the newest time point is older than this ("7d", "48h")`)
 	strict := fs.Bool("strict", false, "treat warnings as failures (exit 1) — for CI gates")
+	failOn := fs.String("fail-on", "", `gate the exit on these checks only, comma list (e.g. "keys,nulls"); the others still run and report but don't affect the exit code. Valid: table,rows,nulls,keys,time,coverage,frozen,numeric ("table" always gates — a gate on a missing table must not pass). Default: every check gates. -o json "ok" stays the full-report truth`)
 	showViol := fs.Bool("show-violations", false, "on a finding, emit sample offending keys + their conflicting values (up to 10), so you don't re-run the GROUP BY by hand")
 	approx := fs.Bool("approx", false, "memory-safe uniqueness: an approx_count_distinct (HyperLogLog) estimate instead of a full GROUP BY — for tables too big to materialize every key")
 	explain := fs.Bool("explain", false, "echo each stage's SQL to stderr (reproduce or extend a check by hand)")
@@ -287,6 +288,25 @@ examples: sparrow check series_data --key series_id --time period
 		return usagef("usage: sparrow check <table> [--key cols] [--time col] [--max-age 7d] [-o json]")
 	}
 	table := pos[0]
+	// Tester wish #4 (2026-07-20): a selective gate. Unknown names are a hard
+	// usage error — a typo'd --fail-on silently gating nothing would be the
+	// same false-negative class as the old silently-skipped --baseline.
+	var gate map[string]bool
+	if *failOn != "" {
+		valid := map[string]bool{"table": true, "rows": true, "nulls": true, "keys": true,
+			"time": true, "coverage": true, "frozen": true, "numeric": true}
+		gate = map[string]bool{"table": true}
+		for _, n := range strings.Split(*failOn, ",") {
+			n = strings.ToLower(strings.TrimSpace(n))
+			if n == "" {
+				continue
+			}
+			if !valid[n] {
+				return usagef("check: --fail-on: unknown check %q (valid: table,rows,nulls,keys,time,coverage,frozen,numeric)", n)
+			}
+			gate[n] = true
+		}
+	}
 	d := &doctor{}
 	switch strings.ToLower(*output) {
 	case "":
@@ -356,11 +376,34 @@ examples: sparrow check series_data --key series_id --time period
 			fmt.Printf("%s — checked in %.1f s (%d queries, server-side)\n",
 				line, time.Since(t0).Seconds(), nq)
 		}
-		if d.fails > 0 {
-			return fmt.Errorf("check: %d finding(s) — see the ✗ lines", d.fails)
+		// --fail-on: the exit decision counts only gated checks; the report
+		// (and rep.OK) stays the full truth. Errors filter too — a non-gated
+		// check that couldn't run shouldn't fail a keys-only gate, but a
+		// GATED check that couldn't run must (no silent pass).
+		gFails, gErrs, gWarns := d.fails, d.errs, d.warns
+		gateNote := ""
+		if gate != nil {
+			gFails, gErrs, gWarns = 0, 0, 0
+			for _, c := range d.rep.Checks {
+				if !gate[c.Check] {
+					continue
+				}
+				switch c.Status {
+				case "fail":
+					gFails++
+				case "error":
+					gErrs++
+				case "warn":
+					gWarns++
+				}
+			}
+			gateNote = " on the --fail-on gate"
 		}
-		if d.errs > 0 {
-			return fmt.Errorf("check: %d check(s) could not run — see the ! lines", d.errs)
+		if gFails > 0 {
+			return fmt.Errorf("check: %d finding(s)%s — see the ✗ lines", gFails, gateNote)
+		}
+		if gErrs > 0 {
+			return fmt.Errorf("check: %d check(s) could not run%s — see the ! lines", gErrs, gateNote)
 		}
 		if baseErr != nil {
 			// hard-fail: a gate that can't read its baseline must not pass
@@ -369,8 +412,8 @@ examples: sparrow check series_data --key series_id --time period
 		if regressions > 0 {
 			return fmt.Errorf("check: %d regression(s) vs the baseline", regressions)
 		}
-		if *strict && d.warns > 0 {
-			return fmt.Errorf("check: %d warning(s) under --strict", d.warns)
+		if *strict && gWarns > 0 {
+			return fmt.Errorf("check: %d warning(s) under --strict%s", gWarns, gateNote)
 		}
 		return nil
 	}

@@ -67,7 +67,8 @@ func classifyAudit(err error, kind string) string {
 	}
 	s := strings.ToLower(err.Error())
 	for _, b := range []string{"disabled by configuration", "configuration has been locked",
-		"permission denied", "permission error", "not allowed", "forbidden"} {
+		"permission denied", "permission error", "not allowed", "forbidden",
+		"read-only", "read only", "not accepted"} {
 		if strings.Contains(s, b) {
 			return "blocked"
 		}
@@ -104,9 +105,10 @@ var auditMark = map[string]string{"exposed": "✗", "blocked": "✓", "n/a": "·
 func cmdAudit(args []string) error {
 	fs := newFlagSet("audit", `usage: sparrow audit [flags]
 security-surface audit: what can a client with SQL access do BEYOND querying?
-Probes file reads, directory listing, file writes, outbound fetch (SSRF), and
-server-config changes. Every probe is benign — reads /etc/hostname, writes
-/dev/null, connects to a dead loopback port, flips an inert setting.
+Probes file reads, directory listing, file writes, outbound fetch (SSRF),
+server-config changes, and catalog writes (CREATE/DROP). Every probe is benign
+— reads /etc/hostname, writes /dev/null, connects to a dead loopback port,
+flips an inert setting, and round-trips a throwaway table (created then dropped).
 Run ONLY against a server you operate or are authorized to test.
 Exit 1 if any surface is exposed — so it gates a deploy.
 examples: sparrow audit · sparrow audit -s prod -o json`)
@@ -140,6 +142,15 @@ examples: sparrow audit · sparrow audit -s prod -o json`)
 		fmt.Print("probing what client SQL can reach beyond the query interface\n\n")
 	}
 	naCount := 0
+	emit := func(f auditFinding) {
+		rep.Findings = append(rep.Findings, f)
+		if !jsonOut {
+			fmt.Printf(" %s %-13s %s\n", auditMark[f.Verdict], f.Probe, f.Detail)
+			if f.Hint != "" {
+				fmt.Println("               hint: " + f.Hint)
+			}
+		}
+	}
 	for _, pr := range auditProbes {
 		pctx, pcancel := context.WithTimeout(ctx, 20*time.Second)
 		_, e := queryRow(pctx, cl, pr.sql)
@@ -158,13 +169,42 @@ examples: sparrow audit · sparrow audit -s prod -o json`)
 		default:
 			f.Detail = "could not determine: " + firstLine(e)
 		}
-		rep.Findings = append(rep.Findings, f)
-		if !jsonOut {
-			fmt.Printf(" %s %-13s %s\n", auditMark[v], pr.name, f.Detail)
-			if f.Hint != "" {
-				fmt.Println("               hint: " + f.Hint)
-			}
+		emit(f)
+	}
+
+	// catalog-write probe (tester S1, 2026-07-18): can a client CREATE a
+	// persistent object in the server's writable catalog? That's what let a
+	// client DROP the FTS backing store out from under search_meta. Benign
+	// round-trip: CREATE OR REPLACE a uniquely-named table, then drop it. A
+	// read-only-enforcing server refuses the CREATE (→ blocked); a stock
+	// DuckDB server permits it (→ exposed). Cleanup is best-effort but the
+	// CREATE only runs when the server ALLOWS writes, so a leftover means the
+	// server is exposed anyway (and IF NOT... the DROP mirrors the create).
+	{
+		const probe = "__sparrow_audit_catwrite"
+		pctx, pcancel := context.WithTimeout(ctx, 20*time.Second)
+		_, ce := queryRow(pctx, cl, "CREATE OR REPLACE TABLE "+probe+" (x INTEGER)")
+		pcancel()
+		v := classifyAudit(ce, "exec")
+		f := auditFinding{Probe: "catalog-write", Verdict: v}
+		switch v {
+		case "exposed":
+			f.Detail = "client SQL can CREATE/DROP objects in the server's catalog (can corrupt server-owned tables — e.g. an FTS index — or fill memory)"
+			f.Hint = "open the client-facing DuckDB catalog read-only, or gate DDL (enforce single-SELECT); isolate any server-owned tables from the client-writable catalog"
+			rep.Exposed++
+			// clean up the object we just created
+			dctx, dcancel := context.WithTimeout(ctx, 20*time.Second)
+			queryRow(dctx, cl, "DROP TABLE IF EXISTS "+probe)
+			dcancel()
+		case "blocked":
+			f.Detail = "DDL refused — catalog is not client-writable"
+		case "n/a":
+			f.Detail = "not reachable (non-DuckDB engine, or no writable catalog)"
+			naCount++
+		default:
+			f.Detail = "could not determine: " + firstLine(ce)
 		}
+		emit(f)
 	}
 
 	if jsonOut {
@@ -175,7 +215,7 @@ examples: sparrow audit · sparrow audit -s prod -o json`)
 		switch {
 		case rep.Exposed > 0:
 			fmt.Printf("%d exposed — this server lets client SQL reach beyond querying\n", rep.Exposed)
-		case naCount == len(auditProbes):
+		case naCount == len(auditProbes)+1: // +1 for the catalog-write probe
 			fmt.Println("no DuckDB file/network primitives reachable — hardened, or not a DuckDB-backed server")
 		default:
 			fmt.Println("clean — no exposed surface found")

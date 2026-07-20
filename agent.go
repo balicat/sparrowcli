@@ -6,18 +6,96 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
 func cmdAgent(args []string) error {
-	fs := newFlagSet("agent", `usage: sparrow agent
+	fs := newFlagSet("agent", `usage: sparrow agent [--json]
 Print a complete agent-ready manual (markdown) for driving sparrow, to stdout.
 Self-contained — no server connection needed. Save it or pipe it:
   sparrow agent > SPARROW.md
+--json emits a machine-readable capability catalog instead (commands, flags,
+exit codes, ticket dialects, output formats) — for programmatic bootstrap
+against an unknown sparrow version.
 For a specific server's live tables and macros, run `+"`sparrow orient`"+` after.`)
+	asJSON := fs.Bool("json", false, "emit a machine-readable capability catalog (JSON) instead of the markdown manual")
 	parseFlags(fs, args)
+	if *asJSON {
+		return agentJSON()
+	}
 	fmt.Print(strings.Replace(agentGuide, "{{VERSION}}", versionString(), 1))
+	return nil
+}
+
+// agentJSON — tester wish #3 (2026-07-20): a structured self-description an
+// agent can parse instead of scraping markdown. Built from the SAME tables
+// shell completion uses (completion.go), so it cannot drift from the real
+// command/flag surface.
+func agentJSON() error {
+	type cmdEntry struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Flags       []string `json:"flags"`
+		ServerSide  bool     `json:"server_side"` // accepts connection flags
+	}
+	names := make([]string, 0, len(cmdDesc))
+	for c := range cmdDesc {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	cmds := make([]cmdEntry, 0, len(names))
+	for _, c := range names {
+		flags := make([]string, 0, 8)
+		for _, f := range cmdOwnFlags[c] {
+			flags = append(flags, "--"+f)
+		}
+		cmds = append(cmds, cmdEntry{
+			Name: c, Description: cmdDesc[c], Flags: flags, ServerSide: serverCmds[c],
+		})
+	}
+	connFlags := make([]string, 0, len(connFlagNames))
+	for _, f := range connFlagNames {
+		connFlags = append(connFlags, "--"+f)
+	}
+	cat := map[string]any{
+		"name":        "sparrow",
+		"version":     versionString(),
+		"description": "command-line client for any Apache Arrow Flight / Flight SQL server",
+		"exit_codes": map[string]string{
+			"0": "ok",
+			"1": "query error, or a gate hit (check findings, diff drift, audit exposure)",
+			"2": "connection/auth failure — run `sparrow doctor -o json` for a layered diagnosis",
+			"3": "usage error",
+		},
+		"connection_flags": connFlags,
+		"commands":         cmds,
+		"output_formats":   []string{"table", "csv", "json", "jsonl", "md", "arrow", "<file path: .parquet .csv .json .jsonl .arrow .md>"},
+		"output_conventions": map[string]any{
+			"stdout":              "data only (md/jsonl/csv are stable and ANSI-free; a pipe defaults to raw Arrow IPC)",
+			"stderr":              "row-count and timing summaries, --stats/--ipc anatomy",
+			"md_stdout_row_cap":   1000,
+			"row_cap_override":    "--max-rows",
+			"schema_only_no_rows": "sql --schema",
+		},
+		"ticket_dialects": map[string]any{
+			"series":      map[string]any{"example": map[string]any{"series": []string{"ID1", "ID2"}, "start": "2020-01-01", "end": "2021-01-01"}, "note": "start/end optional; unknown ids are omitted, not errors"},
+			"sql":         map[string]any{"example": map[string]any{"sql": "SELECT ..."}, "note": "read-only; server enforces"},
+			"negotiation": "pull injects accept_compression (default lz4) into Sparrow-dialect tickets; --dry-run shows the final ticket without sending",
+		},
+		"docs": map[string]string{
+			"manual":           "sparrow agent            (markdown, self-contained)",
+			"per_command_help": "sparrow help <command>   (or <command> -h)",
+			"live_catalog":     "sparrow orient           (server-specific tables, schemas, macros)",
+		},
+	}
+	out, err := json.MarshalIndent(cat, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
 	return nil
 }
 
@@ -114,6 +192,8 @@ Some servers expose **table MACROs** — they appear in ` + "`ls`" + `/` + "`ori
 sparrow ping -o json                       # network vs server latency, percentiles
 sparrow sql "..." --stats                  # plan/first-byte/stream ms, wire bytes, codec, throughput (stderr)
 sparrow check <table> --key id -o json     # data health: nulls, dup keys, staleness; exit 1 = findings (gates CI)
+sparrow check <table> --fail-on keys       # gate the exit on named checks only; the rest still report
+sparrow audit -o json                      # what client SQL reaches beyond queries (files, SSRF, catalog writes) — a server you operate
 sparrow diff <t> --against <profile|uri>   # schema/count/bounds drift vs a second server; exit 1 = drift
 sparrow profile <table> -o json            # per-column nulls / approx-distinct / min / max, one server-side pass
 ` + "```" + `
@@ -139,7 +219,7 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`ping`" + ` | latency percentiles: network vs server |
 | ` + "`feedback \"...\"`" + ` | reach the sparrow maintainers |
 | ` + "`profiles`" + ` | list / use / rm saved connections |
-| ` + "`agent`" + ` | print this guide |
+| ` + "`agent [--json]`" + ` | print this guide; ` + "`--json`" + ` = a parseable capability catalog |
 
 Connection flags work on every server command: ` + "`-s <profile|uri>`" + `,
 ` + "`--basic user:pass`" + `, ` + "`--bearer TOKEN`" + `, ` + "`--header k=v`" + `, ` + "`--tls-ca/--tls-cert/--tls-key`" + `.

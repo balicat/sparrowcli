@@ -147,10 +147,14 @@ server is ("direct JSON tickets").
 By default a Sparrow ticket also requests lz4 compression (the server
 compresses only if it offers it; arrow-go decodes transparently and --stats
 reports the codec + ratio). Pass --accept-compression "" to send verbatim.
+--dry-run prints the FINAL composed ticket (after any accept_compression
+injection) to stdout and exits without connecting — see exactly what would go
+on the wire.
 examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
           sparrow pull '{"series": ["FRED.DFF"], "start": "2020-01-01"}' -o md
           sparrow pull @ticket.json -o data.parquet
           sparrow pull '{"sql": "SELECT …"}' --stats   # wire line shows codec lz4_frame
+          sparrow pull '{"series": ["PET.RWTC.D"]}' --dry-run   # show the wire ticket, send nothing
           echo '{"series": ["PET.RWTC.D"]}' | sparrow pull - --stats`)
 	cf := addConnFlags(fs)
 	output := fs.String("o", "", "output: table|csv|json|jsonl|md|arrow, or a file path")
@@ -161,6 +165,7 @@ examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64 as quoted strings in JSON output")
 	acceptComp := fs.String("accept-compression", "lz4",
 		"codecs to request on a Sparrow ticket (comma list); the server compresses only for a listed one and arrow-go decodes it transparently. \"\"|none to send the ticket verbatim")
+	dryRun := fs.Bool("dry-run", false, "print the final composed ticket (after accept_compression injection) to stdout and exit — nothing is sent")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef("usage: sparrow pull '<ticket>' (or @file, or - for stdin)")
@@ -187,5 +192,12 @@ examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
 		return usagef("pull: empty ticket")
 	}
 	ticket = withAcceptCompression(ticket, *acceptComp)
+	if *dryRun {
+		// Tester wish #1 (2026-07-20): the injection was only verifiable
+		// behaviorally (or with a wire proxy) — print the EXACT bytes DoGet
+		// would carry, so the inject/negotiate path is self-verifying.
+		fmt.Println(string(ticket))
+		return nil
+	}
 	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
 }

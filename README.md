@@ -35,13 +35,13 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
-| `sparrow pull '<ticket>'` | **Direct Pull (1-RTT)**: a ready ticket straight to the server — no `GetFlightInfo`, no SQL (`doget` is a hidden alias). Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `doctor --server` probes which kind a server is | `DoGet` only |
+| `sparrow pull '<ticket>'` | **Direct Pull (1-RTT)**: a ready ticket straight to the server — no `GetFlightInfo`, no SQL (`doget` is a hidden alias). Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `--dry-run` prints the final composed ticket (after that injection) and sends nothing; `doctor --server` probes which kind a server is | `DoGet` only |
 | `sparrow ticket '<sql>'` \| `--series a,b` | emit a **reusable** pull ticket (JSON) — save it, replay it forever with `pull @file`. A client ticket is stateless (re-run fresh each `pull`); a GetFlightInfo handle is single-use | none (client-side) |
 | `sparrow profile <table>` | per-column nulls %, approx-distinct, min, max — one server-side pass | one aggregate query |
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) — 10 surface probes incl. IPC compression) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
-| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
+| `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--fail-on keys,nulls` gates the exit on named checks only (the rest still report) · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
-| `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper. Exit 1 if exposed | benign probes; run against a server you operate |
+| `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper, **catalog writes (CREATE/DROP)**. Exit 1 if exposed | benign probes (incl. a create-then-drop round-trip); run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
 | `sparrow feedback "msg"` | send feedback to the sparrow maintainers | HTTPS to sparrowflight.io — independent of whichever server you use |
 | `sparrow completion bash\|zsh\|fish` | shell tab-completion script | — |
@@ -334,7 +334,10 @@ GOOS=windows go build -o sparrow.exe .
 driving the CLI — every command, the `sql`-vs-`pull` decision, the output and
 exit-code conventions, how to call server-advertised macros like full-text
 search. Point an agent at it once (`sparrow agent > SPARROW.md`) and it can
-operate the tool with no other docs. The rest of this section is the summary.
+operate the tool with no other docs. `sparrow agent --json` emits the same
+surface as a machine-readable capability catalog (commands, flags, exit codes,
+ticket dialects) for programmatic bootstrap against an unknown version. The
+rest of this section is the summary.
 
 AI agents don't need a Flight client library — they can just call the CLI.
 **One command maps a Flight server** — vendor, tables, schemas, as markdown:
