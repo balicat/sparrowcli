@@ -158,6 +158,26 @@ sparrow pull @wti.ticket -o md          # replay it, as often as you like — 1 
 - ` + "`sql --schema`" + ` prints columns + Arrow types and **fetches no rows** — cheap
   shape-check before a big pull.
 
+## Don't flood yourself — size awareness (estimate → decide → enforce)
+
+Before pulling something you can't size, **estimate**; when you can't trust the
+size, **enforce a ceiling**. Two commands, both self-preservation:
+
+- ` + "`sparrow sql \"...\" --cost`" + ` — prints an estimate to stderr and streams
+  **nothing**: exact row count (` + "`count(*)`" + `) + a decoded-bytes extrapolation from
+  a first-batch sample + whether it exceeds the 1000-row ` + "`-o md`" + ` cap. The "how
+  much" sibling of ` + "`--schema`" + `'s "what shape".
+- ` + "`--budget \"10MB\" | \"5000rows\" | \"30s\"`" + ` (on ` + "`sql`" + `/` + "`query`" + `/` + "`pull`" + `) — a hard
+  ceiling. The stream is **aborted** the moment it's crossed, **exit 1**. Rows
+  cap exactly (you get all N); bytes/time stop at a batch boundary. Comma-AND
+  multiple: ` + "`--budget 10MB,30s`" + `. A budget-stopped result is a FAILURE, not a
+  short answer — never treat exit 1 here as "the whole result".
+
+` + "```sh" + `
+sparrow sql "SELECT * FROM series_data WHERE series_id='PET.RWTC.D'" --cost   # ~10,217 rows / ~347 KB — decide before fetching
+sparrow pull '{"series":["UNKNOWN"]}' --budget 5MB -o data.parquet            # safety net on an unknown series
+` + "```" + `
+
 ## Server-advertised functions (e.g. full-text search)
 
 Some servers expose **table MACROs** — they appear in ` + "`ls`" + `/` + "`orient`" + ` with type
@@ -207,10 +227,10 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`orient`" + ` | one-shot markdown map: vendor, tables, schemas |
 | ` + "`ls [pattern]`" + ` | list tables (pattern = SQL LIKE) |
 | ` + "`info <table>`" + ` | schema, catalog, row count |
-| ` + "`sql \"...\"`" + ` | run a statement (` + "`-`" + ` stdin, ` + "`-f`" + ` file, ` + "`--schema`" + `, ` + "`--stats`" + `, ` + "`--substrait`" + `) |
+| ` + "`sql \"...\"`" + ` | run a statement (` + "`-`" + ` stdin, ` + "`-f`" + ` file, ` + "`--schema`" + `, ` + "`--cost`" + `, ` + "`--budget`" + `, ` + "`--stats`" + `, ` + "`--substrait`" + `) |
 | ` + "`query <table>`" + ` | build a simple SELECT (` + "`--where --order --limit`" + `) |
 | ` + "`head <table> [n]`" + ` | preview first n rows |
-| ` + "`pull '<ticket>'`" + ` | Direct Pull (1-RTT); ` + "`doget`" + ` is a hidden alias |
+| ` + "`pull '<ticket>'`" + ` | Direct Pull (1-RTT); ` + "`--budget`" + ` caps the stream; ` + "`doget`" + ` is a hidden alias |
 | ` + "`ticket \"<sql>\"`" + ` | emit a reusable pull ticket (JSON) to save & replay |
 | ` + "`profile <table>`" + ` | per-column null/distinct/min/max |
 | ` + "`doctor [--server]`" + ` | connection diagnosis; ` + "`--server`" + ` = Flight SQL conformance card |

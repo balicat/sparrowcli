@@ -1088,10 +1088,15 @@ func ipcCodec(header []byte) (codec string, isRecordBatch bool) {
 func (b *byteCounter) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
 func (b *byteCounter) HandleConn(context.Context, stats.ConnStats)                       {}
 
-func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, s sink, maxRows int, st *qstats) (int64, error) {
+func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightInfo, s sink, maxRows int, st *qstats, bg *budget) (int64, error) {
 	rw := &recordWriter{s: s, maxRows: maxRows}
 	tStream := time.Now()
+	var streamedBytes int64
+	var over *budgetError // set when a ceiling is crossed; flushed after end()
 	for _, ep := range info.Endpoint {
+		if over != nil {
+			break
+		}
 		rdr, err := cl.DoGet(ctx, ep.Ticket)
 		if err != nil {
 			return rw.total, err
@@ -1103,15 +1108,43 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 			}
 		}
 		for rdr.Next() {
-			if st != nil {
-				st.observe(rdr.Record(), tStream)
+			rec := rdr.Record()
+			// --budget: stop the stream (server stops sending) the moment a
+			// ceiling is met. Rows: slice this batch to exactly the ceiling and
+			// stop — a hard cap you get all N of. Bytes/time: emit-then-check,
+			// so you always get ≥1 batch and never a surprising 0 rows. The
+			// error is the signal (exit 1) — an agent must not mistake a
+			// budget-stopped stream for a complete result.
+			if bg != nil && bg.rows > 0 && rw.total+rec.NumRows() > bg.rows {
+				keep := bg.rows - rw.total
+				if keep > 0 {
+					rec = rec.NewSlice(0, keep)
+				}
+				over = &budgetError{fmt.Sprintf("--budget: hit the %s-row ceiling — stream stopped",
+					groupDigits(strconv.FormatInt(bg.rows, 10)))}
 			}
-			if err := rw.write(rdr.Record()); err != nil {
+			if st != nil {
+				st.observe(rec, tStream)
+			}
+			if err := rw.write(rec); err != nil {
 				rdr.Release()
 				return rw.total, err
 			}
+			streamedBytes += recordBytes(rec)
 			if st != nil {
 				st.lastDone = time.Now() // waits exclude our own sink-write time
+			}
+			if over == nil && bg != nil {
+				if bg.bytes > 0 && streamedBytes >= bg.bytes {
+					over = &budgetError{fmt.Sprintf("--budget: hit the %s ceiling — stream stopped at ~%s decoded",
+						fmtBytes(bg.bytes), fmtBytes(streamedBytes))}
+				} else if bg.dur > 0 && time.Since(tStream) > bg.dur {
+					over = &budgetError{fmt.Sprintf("--budget: hit the %s time ceiling — stream stopped at %s rows",
+						bg.dur, groupDigits(strconv.FormatInt(rw.total, 10)))}
+				}
+			}
+			if over != nil {
+				break
 			}
 		}
 		err = rdr.Err()
@@ -1134,6 +1167,9 @@ func consumeInfo(ctx context.Context, cl *flightsql.Client, info *flight.FlightI
 	}
 	if rw.maxRows > 0 && rw.total > rw.written {
 		fmt.Fprintf(os.Stderr, "… %d rows total (showing %d — raise --max-rows or add a LIMIT)\n", rw.total, rw.written)
+	}
+	if over != nil {
+		return rw.total, *over // budget ceiling hit — exit 1, output already flushed
 	}
 	return rw.total, nil
 }
@@ -1303,7 +1339,7 @@ example: sparrow ls "series_%" -o md`)
 	if err != nil {
 		return err
 	}
-	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000, s.path != ""), nil)
+	_, err = consumeInfo(ctx, cl, info, s, autoMaxRows(-1, s.format, 1000, s.path != ""), nil, nil)
 	return err
 }
 
@@ -1324,6 +1360,8 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr: message type, rows, body bytes, codec, custom metadata")
 	schemaOnly := fs.Bool("schema", false, "print the result's column names + Arrow types and exit — no rows fetched")
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl (preserve precision for JS consumers)")
+	cost := fs.Bool("cost", false, "estimate result size (exact rows + a first-batch bytes/row extrapolation) and exit — nothing streamed; the 'how much' sibling of --schema")
+	budgetSpec := fs.String("budget", "", `abort the stream if it crosses a ceiling: "10MB" | "5000rows" | "30s" (comma-AND them: "10MB,30s"). Exit 1 on breach — an agent can't flood its context or hammer a server`)
 	pos := parseFlags(fs, args)
 	var query string
 	var plan []byte
@@ -1365,7 +1403,18 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 		}
 		return printQuerySchema(cf, query)
 	}
-	return execStatement(cf, query, plan, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+	xt := execExtra{cost: *cost}
+	if *budgetSpec != "" {
+		b, err := parseBudget(*budgetSpec)
+		if err != nil {
+			return usagef("%v", err)
+		}
+		xt.budget = &b
+	}
+	if *cost && plan != nil {
+		return usagef("--cost estimates a SQL query; not available with --substrait")
+	}
+	return execStatement(cf, query, plan, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt)
 }
 
 // printQuerySchema executes a query but reads only the result's schema —
@@ -1417,7 +1466,14 @@ func printQuerySchema(cf *connFlags, query string) error {
 // dial, run, sink, and the optional --stats / --ipc reports. A non-nil
 // plan executes as a Substrait plan (CommandStatementSubstraitPlan)
 // instead of SQL text — gated on the server's advertised capability.
-func execStatement(cf *connFlags, query string, plan []byte, ticket []byte, output, encKey string, maxRows int, statsOn, ipcOn, bigintStr bool) error {
+// execExtra carries the optional preflight/enforcement knobs so execStatement's
+// core signature stays stable; the zero value is "off".
+type execExtra struct {
+	cost   bool    // --cost: estimate size, don't stream (sql/query only)
+	budget *budget // --budget: hard streaming ceiling (nil = unset)
+}
+
+func execStatement(cf *connFlags, query string, plan []byte, ticket []byte, output, encKey string, maxRows int, statsOn, ipcOn, bigintStr bool, xt execExtra) error {
 	p, _, err := cf.resolve()
 	if err != nil {
 		return err
@@ -1438,6 +1494,19 @@ func execStatement(cf *connFlags, query string, plan []byte, ticket []byte, outp
 		return err
 	}
 	defer cl.Close()
+
+	// --cost: preflight the size and exit without streaming the full result.
+	// Needs SQL text (count(*) wrap) — the sql/query commands guard this.
+	if xt.cost {
+		if query == "" {
+			return usagef("--cost needs a SQL query (it wraps it in count(*)); not available for a raw ticket")
+		}
+		s, err := resolveSink(output)
+		if err != nil {
+			return err
+		}
+		return preflightCost(ctx, cl, query, s.format)
+	}
 
 	var info *flight.FlightInfo
 	var t0 time.Time
@@ -1504,7 +1573,7 @@ func execStatement(cf *connFlags, query string, plan []byte, ticket []byte, outp
 		base := wireAtPlan
 		st.wireFn = func() int64 { return counter.in.Load() - base }
 	}
-	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(maxRows, s.format, 40, s.path != ""), st)
+	total, err := consumeInfo(ctx, cl, info, s, autoMaxRows(maxRows, s.format, 40, s.path != ""), st, xt.budget)
 	if err != nil {
 		return err
 	}
@@ -2639,6 +2708,8 @@ usage:
   sparrow ls [pattern] [-s profile] [-o format]
   sparrow info <table> [-s profile] [--no-count]
   sparrow sql "SELECT ..." [-s profile] [-o format|file] [--max-rows N] [--stats] [--ipc]
+  sparrow sql "SELECT ..." --cost                  estimate result size (rows + bytes), stream nothing
+  sparrow sql "SELECT ..." --budget 10MB|5000rows|30s   abort the stream past a ceiling (exit 1)
   sparrow sql -                                   read SQL from stdin (also: -f query.sql)
   sparrow sql --substrait plan.pb                 execute a serialized Substrait plan
   sparrow query <table> [--where ..] [--limit N]   build the SELECT for you (sql sugar)

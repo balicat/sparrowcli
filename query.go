@@ -70,6 +70,8 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	statsOn := fs.Bool("stats", false, "print the query's anatomy to stderr")
 	ipcOn := fs.Bool("ipc", false, "reveal the stream's IPC message manifest on stderr")
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl")
+	cost := fs.Bool("cost", false, "estimate result size (rows + bytes) and exit — nothing streamed")
+	budgetSpec := fs.String("budget", "", `abort the stream past a ceiling: "10MB" | "5000rows" | "30s"; exit 1 on breach`)
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef(`usage: sparrow query <table> [--cols a,b] [--where "..."] [--order col] [--desc] [--limit N]`)
@@ -103,7 +105,15 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	if stdoutIsTTY() {
 		fmt.Fprintln(os.Stderr, "sql: "+q)
 	}
-	return execStatement(cf, q, nil, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+	xt := execExtra{cost: *cost}
+	if *budgetSpec != "" {
+		b, err := parseBudget(*budgetSpec)
+		if err != nil {
+			return usagef("%v", err)
+		}
+		xt.budget = &b
+	}
+	return execStatement(cf, q, nil, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt)
 }
 
 // cmdHead — the SELECT * FROM t LIMIT n shortcut everyone types by hand.
@@ -126,7 +136,7 @@ examples: sparrow head series_data · sparrow head trades 20 -o md`)
 		n = v
 	}
 	q := "SELECT * FROM " + tableExpr(pos[0]) + " LIMIT " + strconv.Itoa(n)
-	return execStatement(cf, q, nil, nil, *output, "", n, false, false, false)
+	return execStatement(cf, q, nil, nil, *output, "", n, false, false, false, execExtra{})
 }
 
 // cmdPull — a Direct Pull (1-RTT): a ready ticket straight to DoGet, no
@@ -166,6 +176,7 @@ examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
 	acceptComp := fs.String("accept-compression", "lz4",
 		"codecs to request on a Sparrow ticket (comma list); the server compresses only for a listed one and arrow-go decodes it transparently. \"\"|none to send the ticket verbatim")
 	dryRun := fs.Bool("dry-run", false, "print the final composed ticket (after accept_compression injection) to stdout and exit — nothing is sent")
+	budgetSpec := fs.String("budget", "", `abort the stream past a ceiling: "10MB" | "5000rows" | "30s"; exit 1 on breach — a safety net when pulling an unknown series`)
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef("usage: sparrow pull '<ticket>' (or @file, or - for stdin)")
@@ -199,5 +210,13 @@ examples: sparrow pull '{"series": ["PET.RWTC.D"]}'
 		fmt.Println(string(ticket))
 		return nil
 	}
-	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr)
+	xt := execExtra{}
+	if *budgetSpec != "" {
+		b, err := parseBudget(*budgetSpec)
+		if err != nil {
+			return usagef("%v", err)
+		}
+		xt.budget = &b
+	}
+	return execStatement(cf, "", nil, ticket, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt)
 }
