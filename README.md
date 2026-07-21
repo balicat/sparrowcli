@@ -334,10 +334,13 @@ sparrow verify neg.json
 and an **order-independent content fingerprint** of the result (a row count plus
 two independent digests, computed server-side via `hash()` aggregates, so
 nothing extra is downloaded and row order doesn't matter). `sparrow verify`
-re-runs the query and confirms the fingerprint still holds: **exit 0** = the
-number is real, **exit 1** = the data changed or the receipt was tampered
-(a fabricated row count or digest is caught). `verify -s <other>` runs the same
-query against a different server — a clean way to ask "do two engines agree?"
+re-runs the query and confirms the fingerprint, the result's column shape, and —
+against the receipt's own endpoint — that the server still identifies as the one
+recorded: **exit 0** = the number is real, **exit 1** = the data/shape/server
+changed or the receipt was tampered (a fabricated row count, digest, columns, or
+vendor is caught), **exit 2** = unreachable/auth, **exit 3** = malformed receipt.
+`verify -s <other>` runs the same query against a different server — a clean way
+to ask "do two engines agree?"
 (they do here: `flight` and `flight2` return an identical digest over the same
 136M-row snapshot). A query that isn't deterministic server-side (`now()`,
 `random()`) won't verify — which is the honest result.

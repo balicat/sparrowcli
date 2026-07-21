@@ -51,8 +51,8 @@ func parseBudget(spec string) (budget, error) {
 			continue
 		}
 		switch {
-		case strings.HasSuffix(s, "rows"): // before "ms"/"s" — "rows" ends in "s"
-			n, err := strconv.ParseInt(strings.TrimSuffix(s, "rows"), 10, 64)
+		case hasAnySuffix(s, "rows", "row"): // before "ms"/"s" — "rows" ends in "s"
+			n, err := strconv.ParseInt(trimAnySuffix(s, "rows", "row"), 10, 64)
 			if err != nil {
 				return b, fmt.Errorf("--budget: bad row count %q", part)
 			}
@@ -63,8 +63,8 @@ func parseBudget(spec string) (budget, error) {
 				return b, fmt.Errorf("--budget: bad duration %q", part)
 			}
 			b.dur = time.Duration(ms) * time.Millisecond
-		case strings.HasSuffix(s, "s"):
-			sec, err := strconv.ParseFloat(strings.TrimSuffix(s, "s"), 64)
+		case hasAnySuffix(s, "seconds", "second", "secs", "sec", "s"):
+			sec, err := strconv.ParseFloat(trimAnySuffix(s, "seconds", "second", "secs", "sec", "s"), 64)
 			if err != nil {
 				return b, fmt.Errorf("--budget: bad duration %q", part)
 			}
@@ -93,6 +93,27 @@ func parseBudget(spec string) (budget, error) {
 		return b, fmt.Errorf("--budget: empty or zero ceiling %q", spec)
 	}
 	return b, nil
+}
+
+// hasAnySuffix / trimAnySuffix let one unit accept singular + long spellings
+// (5rows/5row, 30s/30sec/30seconds) — tester B1 (2026-07-21). Longest first so
+// "second" wins over "s".
+func hasAnySuffix(s string, suffixes ...string) bool {
+	for _, suf := range suffixes {
+		if strings.HasSuffix(s, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimAnySuffix(s string, suffixes ...string) string {
+	for _, suf := range suffixes {
+		if strings.HasSuffix(s, suf) {
+			return strings.TrimSuffix(s, suf)
+		}
+	}
+	return s
 }
 
 func parseUnit(s, suffix string, mult float64) int64 {

@@ -207,10 +207,12 @@ confirm it wasn't invented:
   manifest: the query, the server's identity, a timestamp, and an
   **order-independent content fingerprint** of the result (count + two digests,
   computed server-side — nothing extra downloaded).
-- ` + "`sparrow verify r.json`" + ` re-runs the query and confirms the fingerprint still
-  matches: **exit 0** = verified, **exit 1** = the data changed or the number
-  was tampered. ` + "`-s <other>`" + ` verifies the same query against a different server
-  (do two servers agree?).
+- ` + "`sparrow verify r.json`" + ` re-runs the query and confirms it: **exit 0** =
+  verified, **exit 1** = the result, its column shape, or the server's identity
+  no longer matches, **exit 2** = couldn't reach/authenticate, **exit 3** = the
+  receipt itself is malformed. Against the receipt's own endpoint it also checks
+  the server still identifies the same; ` + "`-s <other>`" + ` deliberately targets a
+  different server to ask "do two engines agree on the DATA?".
 
 ` + "```sh" + `
 sparrow sql "SELECT count(*) FROM series_data WHERE value < 0" -o md --receipt neg.json

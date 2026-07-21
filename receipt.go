@@ -59,7 +59,7 @@ func fingerprint(ctx context.Context, cl *flightsql.Client, query string) (recei
 	var res receiptResult
 	cols, err := querySchemaCols(ctx, cl, query)
 	if err != nil {
-		return res, fmt.Errorf("schema: %s", firstLine(err))
+		return res, err // raw — caller classifies auth vs query error
 	}
 	res.Columns = cols
 	if len(cols) == 0 {
@@ -76,7 +76,7 @@ func fingerprint(ctx context.Context, cl *flightsql.Client, query string) (recei
 		hashExpr, hashExpr, inner)
 	row, err := queryRow(ctx, cl, fpSQL)
 	if err != nil {
-		return res, fmt.Errorf("fingerprint: %s", firstLine(err))
+		return res, err // raw — caller classifies
 	}
 	if len(row) < 3 {
 		return res, fmt.Errorf("fingerprint: unexpected result shape")
@@ -162,16 +162,55 @@ examples: sparrow verify wti.receipt.json
 	if r.Kind == "" || r.Query == "" {
 		return usagef("verify: %s is not a sparrow receipt (missing sparrow_receipt/query)", pos[0])
 	}
-
-	// target endpoint: the receipt's own, unless -s overrides it. With no -s,
-	// resolve the default profile's auth/TLS but aim it at the receipt's URI.
-	usedOverride := *cf.server != ""
-	p, _, err := cf.resolve()
-	if err != nil {
-		return err
+	// R4: a structurally-incomplete receipt is a BAD RECEIPT (exit 3), not a
+	// "data changed" (exit 1) — an agent branching on the code must tell them
+	// apart. R5: an unknown fingerprint algorithm can't be verified by this
+	// binary; refuse rather than silently verify with the wrong algo.
+	if r.Result.DigestSum == "" || r.Result.DigestXor == "" {
+		return usagef("verify: %s is an incomplete receipt (missing result fingerprint)", pos[0])
 	}
-	if !usedOverride {
+	if r.Algo != "" && r.Algo != receiptAlgo {
+		return usagef("verify: receipt algo %q is not supported by this binary (%s) — upgrade sparrow", r.Algo, receiptAlgo)
+	}
+
+	// Endpoint + auth resolution (R3):
+	//  -s given            → use that profile/URI as-is (a deliberate other server).
+	//  no -s               → aim at the receipt's endpoint, and find creds by
+	//                        (1) a saved profile whose URI matches it, then
+	//                        (2) standalone --basic/--bearer/TLS flags on top.
+	usedOverride := *cf.server != ""
+	var p Profile
+	if usedOverride {
+		var perr error
+		if p, _, perr = cf.resolve(); perr != nil {
+			return perr
+		}
+	} else {
+		if m, ok := profileByURI(r.Server.Endpoint); ok {
+			p = m
+		} else {
+			p = Profile{Auth: "none"}
+		}
 		p.URI = r.Server.Endpoint
+		if *cf.basic != "" {
+			u, pw, _ := strings.Cut(*cf.basic, ":")
+			p.Auth, p.User, p.Pass = "basic", u, pw
+		}
+		if *cf.bearer != "" {
+			p.Auth, p.Token = "bearer", *cf.bearer
+		}
+		if *cf.tlsSkip {
+			p.TLSSkipVerify = true
+		}
+		if *cf.cert != "" {
+			p.TLSCert = *cf.cert
+		}
+		if *cf.key != "" {
+			p.TLSKey = *cf.key
+		}
+		if *cf.ca != "" {
+			p.TLSCA = *cf.ca
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -185,24 +224,34 @@ examples: sparrow verify wti.receipt.json
 	nowVendor := probeVendor(ctx, cl)
 	res, err := fingerprint(ctx, cl, r.Query)
 	if err != nil {
-		return fmt.Errorf("verify: %v", err)
+		return classifyConnErr(fmt.Errorf("verify: %s", firstLine(err)), err) // R3c: auth/unreachable → exit 2
 	}
 
 	rowsMatch := res.Rows == r.Result.Rows
 	sumMatch := res.DigestSum == r.Result.DigestSum
 	xorMatch := res.DigestXor == r.Result.DigestXor
-	ok := rowsMatch && sumMatch && xorMatch
-	vendorMatch := usedOverride || nowVendor == r.Server.Vendor
+	digestMatch := sumMatch && xorMatch
+	// R2: bind result shape too (skip only when the receipt predates columns).
+	colsMatch := len(r.Result.Columns) == 0 || equalStrings(r.Result.Columns, res.Columns)
+	// R1: a GENUINE vendor comparison, always. Server identity gates the verdict
+	// only when verifying against the receipt's OWN endpoint (no -s); an -s
+	// override deliberately targets a different server, so we report the vendor
+	// but don't fail on it (the point there is cross-server DATA agreement).
+	vendorMatch := nowVendor == r.Server.Vendor
+	dataOK := rowsMatch && digestMatch && colsMatch
+	ok := dataOK && (usedOverride || vendorMatch)
 
 	if jsonOut {
 		rep := map[string]any{
 			"ok":            ok,
 			"endpoint":      p.URI,
+			"override":      usedOverride,
 			"vendor_now":    nowVendor,
 			"vendor_recept": r.Server.Vendor,
 			"vendor_match":  vendorMatch,
 			"rows_match":    rowsMatch,
-			"digest_match":  sumMatch && xorMatch,
+			"digest_match":  digestMatch,
+			"columns_match": colsMatch,
 			"receipt_rows":  r.Result.Rows,
 			"now_rows":      res.Rows,
 		}
@@ -217,27 +266,61 @@ examples: sparrow verify wti.receipt.json
 		}
 		fmt.Printf("verify %s\n", pos[0])
 		fmt.Printf(" endpoint   %s%s\n", p.URI, map[bool]string{true: " (-s override)", false: " (from receipt)"}[usedOverride])
-		if !usedOverride {
-			fmt.Printf(" %s server    %s\n", mark(vendorMatch), vendorLine(nowVendor, r.Server.Vendor, vendorMatch))
+		if usedOverride {
+			// vendor reported, not gated — you chose this server
+			fmt.Printf(" · server    %s%s\n", nowVendor, mismatchNote(vendorMatch, r.Server.Vendor))
 		} else {
-			fmt.Printf(" · server    %s (receipt: %s)\n", nowVendor, r.Server.Vendor)
+			fmt.Printf(" %s server    %s%s\n", mark(vendorMatch), nowVendor, mismatchNote(vendorMatch, r.Server.Vendor))
 		}
 		fmt.Printf(" %s rows       %s%s\n", mark(rowsMatch), groupDigits(strconv.FormatInt(res.Rows, 10)),
 			mismatchNote(rowsMatch, groupDigits(strconv.FormatInt(r.Result.Rows, 10))))
-		fmt.Printf(" %s digest     %s\n", mark(sumMatch && xorMatch),
-			map[bool]string{true: "matches", false: "DIFFERS — the result changed since the receipt"}[sumMatch && xorMatch])
+		fmt.Printf(" %s columns    %s\n", mark(colsMatch),
+			map[bool]string{true: strings.Join(res.Columns, ", "), false: "DIFFER from the receipt"}[colsMatch])
+		fmt.Printf(" %s digest     %s\n", mark(digestMatch),
+			map[bool]string{true: "matches", false: "DIFFERS — the result changed since the receipt"}[digestMatch])
 	}
 	if !ok {
-		return fmt.Errorf("verify: FAILED — the result does not match the receipt")
+		return fmt.Errorf("verify: FAILED — %s", failReason(dataOK, vendorMatch, usedOverride))
 	}
 	return nil
 }
 
-func vendorLine(now, want string, match bool) string {
-	if match {
-		return now
+func failReason(dataOK, vendorMatch, override bool) string {
+	if !dataOK {
+		return "the result does not match the receipt"
 	}
-	return fmt.Sprintf("%s — receipt was %s", now, want)
+	if !override && !vendorMatch {
+		return "the endpoint no longer identifies as the receipt's server"
+	}
+	return "verification failed"
+}
+
+// profileByURI finds a saved profile whose endpoint URI matches — so a bare
+// `verify r.json` picks up the creds for the receipt's server automatically.
+func profileByURI(uri string) (Profile, bool) {
+	if uri == "" {
+		return Profile{}, false
+	}
+	for _, p := range loadConfig().Profiles {
+		if p.URI == uri {
+			return p, true
+		}
+	}
+	return Profile{}, false
+}
+
+// classifyConnErr returns a connError (exit 2) when the underlying error is an
+// auth/connection failure, else the display error as-is (exit 1). R3c: verify's
+// auth failures must be exit 2 whether or not -s was used.
+func classifyConnErr(display, raw error) error {
+	s := strings.ToLower(raw.Error())
+	for _, m := range []string{"unauthenticated", "permissiondenied", "permission denied",
+		"unavailable", "connection refused", "no route", "deadline exceeded", "invalid_argument: auth"} {
+		if strings.Contains(s, m) {
+			return connError{display}
+		}
+	}
+	return display
 }
 
 func mismatchNote(match bool, want string) string {
