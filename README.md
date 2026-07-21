@@ -32,7 +32,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow orient` | one-shot markdown map: vendor, every table, every schema | `GetSqlInfo` + `GetTables` w/ schemas |
 | `sparrow ls [pattern]` | list tables; the pattern is a server-side SQL `LIKE` (`%`, `_`, case-sensitive) | `GetTables` — the one discovery RPC that works everywhere |
 | `sparrow info <table>` | schema, catalog, row count | `GetTables` w/ schema; `LIMIT 0` fallback |
-| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--cost` estimates result size without streaming; `--budget 10MB\|5000rows\|30s` aborts a stream past a ceiling (exit 1); `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
+| `sparrow sql "<query>"` | run a statement (`-` = stdin, `-f query.sql` = file; `--stats` / `--ipc` stream anatomy; `--schema` = columns+types only; `--cost` estimates result size without streaming; `--budget 10MB\|5000rows\|30s` aborts a stream past a ceiling (exit 1); `--receipt r.json` writes a verifiable receipt of the result; `--bigint-as-string` for JS precision; [`--substrait plan.pb`](docs/substrait.md) executes a Substrait plan) | `CommandStatementQuery` → `GetFlightInfo` → `DoGet` |
 | `sparrow query <table>` | build the one-liner SELECT for you: `--cols` `--where` `--order` `--limit`; everything else works like `sql` | same as `sql` |
 | `sparrow head <table> [n]` | preview the first n rows (default 10) — the `SELECT * … LIMIT n` you keep typing | `Execute` → `DoGet` |
 | `sparrow pull '<ticket>'` | **Direct Pull (1-RTT)**: a ready ticket straight to the server — no `GetFlightInfo`, no SQL (`doget` is a hidden alias). Flight SQL reads are two round trips by design; servers that accept client-made tickets (Sparrow: JSON `{"series": [...]}` or `{"sql": "…"}`) serve known pulls in one — measured 143 vs 224 ms for the same 10k-row series over the public internet, the 81 ms gap being exactly the saved round trip (the win is one RTT, so it shrinks to nothing on a LAN). `--accept-compression lz4` (the default) asks a negotiating server for a compressed wire — decoded transparently; `--dry-run` prints the final composed ticket (after that injection) and sends nothing; `doctor --server` probes which kind a server is | `DoGet` only |
@@ -41,6 +41,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow doctor` | layered connection diagnosis — names the layer that breaks (`--server`: [Flight SQL conformance card](docs/conform.md) — 10 surface probes incl. IPC compression) | staged: DNS → TCP → TLS/ALPN → auth → `GetTables` → `SELECT 1` |
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--fail-on keys,nulls` gates the exit on named checks only (the rest still report) · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
 | `sparrow expect '<sql>' --eq N` \| `--rows 0` \| `--cols a,b` | assert something about a query and exit 1 if it fails — an agent's self-authored **data contract**. Scalar (`--eq/--ne/--gt/--lt/--ge/--le`, numeric-aware), row-count (`--rows/--rows-min/--rows-max/--empty/--nonempty`, wrapped in `COUNT(*)`), or shape (`--cols`, names in order); any combination, all must hold | one query (counts never materialize) |
+| `sparrow verify <receipt.json>` | re-run a receipt's query and confirm the result fingerprint still matches (`sql --receipt r.json` writes one) — **provable provenance**: exit 0 = the number is real, exit 1 = changed/tampered. `-s` verifies the same query against another server | one server-side fingerprint aggregate |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper, **catalog writes (CREATE/DROP)**. Exit 1 if exposed | benign probes (incl. a create-then-drop round-trip); run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
@@ -315,6 +316,34 @@ and a sub-check the server couldn't execute is an `!` error, never a silent
 pass). Staleness, frozen series (a constant
 value across ≥10 observations — a stuck feed's signature), dead columns and
 σ-outliers are warnings. `-o json` for pipelines and agents.
+
+## Prove it — verifiable receipts
+
+When an agent (or a person) reports a number from the data, a **receipt** makes
+it checkable instead of taken on faith:
+
+```sh
+sparrow sql "SELECT count(*) FROM series_data WHERE value < 0" -o md --receipt neg.json
+sparrow verify neg.json
+#  ✓ server    EnergyScope 1.0
+#  ✓ rows       10,217
+#  ✓ digest     matches
+```
+
+`--receipt` writes a manifest — the query, the server's identity, a timestamp,
+and an **order-independent content fingerprint** of the result (a row count plus
+two independent digests, computed server-side via `hash()` aggregates, so
+nothing extra is downloaded and row order doesn't matter). `sparrow verify`
+re-runs the query and confirms the fingerprint still holds: **exit 0** = the
+number is real, **exit 1** = the data changed or the receipt was tampered
+(a fabricated row count or digest is caught). `verify -s <other>` runs the same
+query against a different server — a clean way to ask "do two engines agree?"
+(they do here: `flight` and `flight2` return an identical digest over the same
+136M-row snapshot). A query that isn't deterministic server-side (`now()`,
+`random()`) won't verify — which is the honest result.
+
+Compose it with [`expect`](#commands): **assert** a contract, **receipt** the
+result, let a third party **verify** it. Analysis you can check, not just trust.
 
 ## Install
 

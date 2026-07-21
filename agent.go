@@ -198,6 +198,29 @@ Some servers expose **table MACROs** — they appear in ` + "`ls`" + `/` + "`ori
   sparrow sql "SELECT parameters FROM duckdb_functions() WHERE function_name='search_meta'"
   ` + "```" + `
 
+## Prove a number — verifiable receipts
+
+When you report a figure from the data, back it with a **receipt** so anyone can
+confirm it wasn't invented:
+
+- ` + "`sparrow sql \"...\" --receipt r.json`" + ` runs the query normally AND writes a
+  manifest: the query, the server's identity, a timestamp, and an
+  **order-independent content fingerprint** of the result (count + two digests,
+  computed server-side — nothing extra downloaded).
+- ` + "`sparrow verify r.json`" + ` re-runs the query and confirms the fingerprint still
+  matches: **exit 0** = verified, **exit 1** = the data changed or the number
+  was tampered. ` + "`-s <other>`" + ` verifies the same query against a different server
+  (do two servers agree?).
+
+` + "```sh" + `
+sparrow sql "SELECT count(*) FROM series_data WHERE value < 0" -o md --receipt neg.json
+sparrow verify neg.json          # ✓ verified — the count is real
+` + "```" + `
+
+Compose it with ` + "`expect`" + `: **assert** a contract, **receipt** the result,
+let a third party **verify** — your analysis is checkable, not just plausible.
+(A non-deterministic query — ` + "`now()`" + `, ` + "`random()`" + ` — won't verify; that's correct.)
+
 ## When something breaks — exit codes are your branch
 
 - ` + "`0`" + ` ok · ` + "`1`" + ` query error (your SQL/ticket was wrong) · ` + "`2`" + ` connection/auth
@@ -236,6 +259,7 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`doctor [--server]`" + ` | connection diagnosis; ` + "`--server`" + ` = Flight SQL conformance card |
 | ` + "`check <table>`" + ` | data-quality gate (exit 1 on findings) |
 | ` + "`expect \"<sql>\"`" + ` | assert a query result (--eq/--rows/--empty/--cols); exit 1 on violation |
+| ` + "`verify <receipt>`" + ` | re-run a receipt's query, confirm the fingerprint matches (` + "`sql --receipt`" + ` writes one) |
 | ` + "`diff <t> --against`" + ` | drift gate vs a second server |
 | ` + "`audit`" + ` | security surface of a server you operate |
 | ` + "`ping`" + ` | latency percentiles: network vs server |

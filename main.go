@@ -1362,6 +1362,7 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl (preserve precision for JS consumers)")
 	cost := fs.Bool("cost", false, "estimate result size (exact rows + a first-batch bytes/row extrapolation) and exit — nothing streamed; the 'how much' sibling of --schema")
 	budgetSpec := fs.String("budget", "", `abort the stream if it crosses a ceiling: "10MB" | "5000rows" | "30s" (comma-AND them: "10MB,30s"). Exit 1 on breach — an agent can't flood its context or hammer a server`)
+	receiptPath := fs.String("receipt", "", "also write a verifiable receipt (JSON) of the result to this path — query + server identity + content fingerprint; check it later with `sparrow verify`")
 	pos := parseFlags(fs, args)
 	var query string
 	var plan []byte
@@ -1414,7 +1415,16 @@ examples: sparrow sql "SELECT 42 AS x" -o md
 	if *cost && plan != nil {
 		return usagef("--cost estimates a SQL query; not available with --substrait")
 	}
-	return execStatement(cf, query, plan, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt)
+	if *receiptPath != "" && (plan != nil || query == "") {
+		return usagef("--receipt needs a SQL query (it fingerprints the result); not available with --substrait")
+	}
+	if err := execStatement(cf, query, plan, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt); err != nil {
+		return err
+	}
+	if *receiptPath != "" {
+		return writeReceipt(cf, query, *receiptPath, isoNow())
+	}
+	return nil
 }
 
 // printQuerySchema executes a query but reads only the result's schema —
@@ -2721,6 +2731,8 @@ usage:
   sparrow doctor --server                         conformance card: which Flight SQL surfaces work
   sparrow check <table> [--key c] [--time c]      data doctor: nulls·dupes·staleness·frozen·outliers
   sparrow expect "<sql>" --eq N | --rows 0 | …     assert something about a query; exit 1 on violation (a data contract)
+  sparrow sql "<sql>" --receipt r.json             write a verifiable receipt of the result (query + server + content fingerprint)
+  sparrow verify r.json                            re-run a receipt's query and confirm the fingerprint still matches
   sparrow diff <table> --against <profile|uri>    drift gate: schema·count·bounds vs a second server
   sparrow audit [-s profile] [-o json]            security surface: what client SQL can reach beyond queries
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
@@ -2770,6 +2782,8 @@ func main() {
 		err = cmdCheck(os.Args[2:])
 	case "expect":
 		err = cmdExpect(os.Args[2:])
+	case "verify":
+		err = cmdVerify(os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
 	case "audit":
@@ -2816,6 +2830,8 @@ func main() {
 				err = cmdCheck([]string{"-h"})
 			case "expect":
 				err = cmdExpect([]string{"-h"})
+			case "verify":
+				err = cmdVerify([]string{"-h"})
 			case "diff":
 				err = cmdDiff([]string{"-h"})
 			case "audit":

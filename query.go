@@ -72,6 +72,7 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 	bigintStr := fs.Bool("bigint-as-string", false, "emit int64/uint64 as quoted strings in json/jsonl")
 	cost := fs.Bool("cost", false, "estimate result size (rows + bytes) and exit — nothing streamed")
 	budgetSpec := fs.String("budget", "", `abort the stream past a ceiling: "10MB" | "5000rows" | "30s"; exit 1 on breach`)
+	receiptPath := fs.String("receipt", "", "also write a verifiable receipt (JSON) of the result to this path")
 	pos := parseFlags(fs, args)
 	if len(pos) < 1 {
 		return usagef(`usage: sparrow query <table> [--cols a,b] [--where "..."] [--order col] [--desc] [--limit N]`)
@@ -113,7 +114,13 @@ examples: sparrow query series_data --where "series_id='PET.RWTC.D'" --limit 20
 		}
 		xt.budget = &b
 	}
-	return execStatement(cf, q, nil, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt)
+	if err := execStatement(cf, q, nil, nil, *output, *encKey, *maxRows, *statsOn, *ipcOn, *bigintStr, xt); err != nil {
+		return err
+	}
+	if *receiptPath != "" {
+		return writeReceipt(cf, q, *receiptPath, isoNow())
+	}
+	return nil
 }
 
 // cmdHead — the SELECT * FROM t LIMIT n shortcut everyone types by hand.
