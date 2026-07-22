@@ -376,7 +376,9 @@ gating on `replay && …` can't be fooled by a pull-only session.
 "how I arrived at this" turned into a regression test you (or a reviewer, or CI)
 can re-run. Pull steps are recorded for the narrative but marked "not checked"
 (no server-side fingerprint). It's the reusable-ticket idea lifted from one
-query to a whole exploration.
+query to a whole exploration. One caveat: the SQL text is recorded **verbatim**
+(replay must re-run it) — credential *flags* are redacted, but a secret inside
+a query literal is not. Keep secrets out of SQL you record.
 
 ## Install
 

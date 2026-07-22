@@ -239,6 +239,9 @@ the investigation reproduces, **exit 1** if any step drifted (it names which and
 how) — or if the file has no verifiable steps at all (nothing confirmed ≠
 confirmed). ` + "`replay -s <other>`" + ` runs the whole investigation against a different
 server. "Here's how I got this number" becomes a regression test.
+Caveat: the SQL text is recorded verbatim (replay must re-run it) — credential
+FLAGS are redacted, but a secret inside a query literal is not. Keep secrets
+out of SQL you record.
 
 ## When something breaks — exit codes are your branch
 

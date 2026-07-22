@@ -109,6 +109,8 @@ investigation reproduces, 1 if any step drifted OR the file has no verifiable
 steps at all (nothing confirmed ≠ confirmed), 2 if a server couldn't be
 reached or authenticated. -s overrides every step's endpoint (replay the
 investigation against a different server).
+Note: the SQL text itself is recorded VERBATIM (replay must re-run it) — only
+credential flags are redacted, so don't put secrets in query literals.
 examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_data"
           sparrow replay probe.jsonl                 # …does it still hold?
           sparrow replay probe.jsonl -s gizmo        # …on another server?`)
