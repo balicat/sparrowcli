@@ -1726,6 +1726,9 @@ total                 %6d ms
 	if s.path != "" && statsOn {
 		fmt.Fprintf(os.Stderr, "✓ → %s\n", s.path)
 	}
+	// SPARROW_SESSION recording (no-op unless the env var is set): append this
+	// read as a replayable step, with a content fingerprint for SQL.
+	recordSession(ctx, cl, query, ticket, p.URI, total, time.Since(t0).Milliseconds())
 	return nil
 }
 
@@ -2733,6 +2736,8 @@ usage:
   sparrow expect "<sql>" --eq N | --rows 0 | …     assert something about a query; exit 1 on violation (a data contract)
   sparrow sql "<sql>" --receipt r.json             write a verifiable receipt of the result (query + server + content fingerprint)
   sparrow verify r.json                            re-run a receipt's query and confirm the fingerprint still matches
+  SPARROW_SESSION=s.jsonl sparrow sql "..."        record reads to a replayable session file (env var); then:
+  sparrow replay s.jsonl                           re-run a recorded investigation and confirm every step reproduces
   sparrow diff <table> --against <profile|uri>    drift gate: schema·count·bounds vs a second server
   sparrow audit [-s profile] [-o json]            security surface: what client SQL can reach beyond queries
   sparrow ping [-n N] [-s profile] [-o json]      latency: bare TCP vs warm-channel RPC, percentiles
@@ -2784,6 +2789,8 @@ func main() {
 		err = cmdExpect(os.Args[2:])
 	case "verify":
 		err = cmdVerify(os.Args[2:])
+	case "replay":
+		err = cmdReplay(os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
 	case "audit":
@@ -2832,6 +2839,8 @@ func main() {
 				err = cmdExpect([]string{"-h"})
 			case "verify":
 				err = cmdVerify([]string{"-h"})
+			case "replay":
+				err = cmdReplay([]string{"-h"})
 			case "diff":
 				err = cmdDiff([]string{"-h"})
 			case "audit":

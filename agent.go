@@ -223,6 +223,22 @@ Compose it with ` + "`expect`" + `: **assert** a contract, **receipt** the resul
 let a third party **verify** — your analysis is checkable, not just plausible.
 (A non-deterministic query — ` + "`now()`" + `, ` + "`random()`" + ` — won't verify; that's correct.)
 
+## Reproducible investigations — record & replay
+
+To make a whole exploration replayable, set ` + "`SPARROW_SESSION=<file>`" + ` and every
+read appends a step (query + endpoint + row count + a fingerprint for SQL):
+
+` + "```sh" + `
+SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_data WHERE value<0"
+SPARROW_SESSION=probe.jsonl sparrow sql "SELECT max(value) FROM series_data"
+sparrow replay probe.jsonl          # …does the whole investigation still hold?
+` + "```" + `
+
+` + "`sparrow replay`" + ` re-runs each SQL step and diffs its fingerprint — **exit 0** if
+the investigation reproduces, **exit 1** if any step drifted (it names which and
+how). ` + "`replay -s <other>`" + ` runs the whole investigation against a different
+server. "Here's how I got this number" becomes a regression test.
+
 ## When something breaks — exit codes are your branch
 
 - ` + "`0`" + ` ok · ` + "`1`" + ` query error (your SQL/ticket was wrong) · ` + "`2`" + ` connection/auth
@@ -262,6 +278,7 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`check <table>`" + ` | data-quality gate (exit 1 on findings) |
 | ` + "`expect \"<sql>\"`" + ` | assert a query result (--eq/--rows/--empty/--cols); exit 1 on violation |
 | ` + "`verify <receipt>`" + ` | re-run a receipt's query, confirm the fingerprint matches (` + "`sql --receipt`" + ` writes one) |
+| ` + "`replay <session>`" + ` | re-run a recorded investigation (SPARROW_SESSION=file), confirm every step reproduces |
 | ` + "`diff <t> --against`" + ` | drift gate vs a second server |
 | ` + "`audit`" + ` | security surface of a server you operate |
 | ` + "`ping`" + ` | latency percentiles: network vs server |
