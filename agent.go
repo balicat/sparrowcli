@@ -236,7 +236,8 @@ sparrow replay probe.jsonl          # …does the whole investigation still hold
 
 ` + "`sparrow replay`" + ` re-runs each SQL step and diffs its fingerprint — **exit 0** if
 the investigation reproduces, **exit 1** if any step drifted (it names which and
-how). ` + "`replay -s <other>`" + ` runs the whole investigation against a different
+how) — or if the file has no verifiable steps at all (nothing confirmed ≠
+confirmed). ` + "`replay -s <other>`" + ` runs the whole investigation against a different
 server. "Here's how I got this number" becomes a regression test.
 
 ## When something breaks — exit codes are your branch

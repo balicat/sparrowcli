@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -104,7 +105,8 @@ Re-run a recorded session and confirm each step still reproduces. A session is
 written by any command run with SPARROW_SESSION=<file> set — every read appends
 a step (query + endpoint + row count + a content fingerprint for SQL). replay
 re-runs each SQL step and diffs its fingerprint: exit 0 if the whole
-investigation reproduces, 1 if any step drifted, 2 if a server couldn't be
+investigation reproduces, 1 if any step drifted OR the file has no verifiable
+steps at all (nothing confirmed ≠ confirmed), 2 if a server couldn't be
 reached or authenticated. -s overrides every step's endpoint (replay the
 investigation against a different server).
 examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_data"
@@ -129,6 +131,8 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 	if err != nil {
 		return usagef("replay: cannot read %s: %s", pos[0], firstLine(err))
 	}
+	// tolerate a UTF-8 BOM — hand-editing a session file in Notepad adds one (F3)
+	raw = bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf"))
 	var steps []sessionStep
 	for i, ln := range strings.Split(string(raw), "\n") {
 		ln = strings.TrimSpace(ln)
@@ -146,11 +150,13 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 	}
 
 	usedOverride := *cf.server != ""
+	// Reproduces is a pointer so non-verifiable steps OMIT it in JSON rather
+	// than showing a misleading false (F4) — absent means "not checked".
 	type stepResult struct {
 		Step       int    `json:"step"`
 		Kind       string `json:"kind"`
 		Verifiable bool   `json:"verifiable"`
-		Reproduces bool   `json:"reproduces"`
+		Reproduces *bool  `json:"reproduces,omitempty"`
 		Detail     string `json:"detail"`
 		RowsRecord int64  `json:"rows_recorded"`
 		RowsNow    int64  `json:"rows_now"`
@@ -208,7 +214,8 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 			if errors.As(err, &ce) || errors.As(classifyConnErr(err, err), &ce) {
 				return connError{fmt.Errorf("replay step %d: %s", i+1, firstLine(err))}
 			}
-			r.Reproduces, r.Detail = false, "re-run failed: "+firstLine(err)
+			no := false
+			r.Reproduces, r.Detail = &no, "re-run failed: "+firstLine(err)
 			failed++
 			results = append(results, r)
 			continue
@@ -216,15 +223,22 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 		r.RowsNow = now.Rows
 		reproduces := now.Rows == s.FP.Rows && now.DigestSum == s.FP.DigestSum &&
 			now.DigestXor == s.FP.DigestXor && equalStrings(now.Columns, s.FP.Columns)
-		r.Reproduces = reproduces
-		if reproduces {
+		r.Reproduces = &reproduces
+		switch {
+		case reproduces:
 			r.Detail = "reproduces"
-		} else if now.Rows != s.FP.Rows {
+		case now.Rows != s.FP.Rows:
 			r.Detail = fmt.Sprintf("row count changed (%s → %s)",
 				groupDigits(strconv.FormatInt(s.FP.Rows, 10)), groupDigits(strconv.FormatInt(now.Rows, 10)))
 			failed++
-		} else {
+		case now.DigestSum != s.FP.DigestSum || now.DigestXor != s.FP.DigestXor:
 			r.Detail = "content changed (same row count, different digest)"
+			failed++
+		default:
+			// rows and digests match — only the column names differ (F1: don't
+			// call that "different digest")
+			r.Detail = fmt.Sprintf("columns changed (recorded: %s → now: %s)",
+				strings.Join(s.FP.Columns, ", "), strings.Join(now.Columns, ", "))
 			failed++
 		}
 		results = append(results, r)
@@ -232,7 +246,7 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 
 	if jsonOut {
 		rep := map[string]any{
-			"ok": failed == 0, "file": pos[0], "steps": len(steps),
+			"ok": failed == 0 && checked > 0, "file": pos[0], "steps": len(steps),
 			"checked": checked, "failed": failed, "results": results,
 		}
 		b, _ := json.MarshalIndent(rep, "", "  ")
@@ -241,8 +255,8 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 		fmt.Printf("replay %s — %d steps\n", pos[0], len(steps))
 		for _, r := range results {
 			mark := "·"
-			if r.Verifiable {
-				mark = map[bool]string{true: "✓", false: "✗"}[r.Reproduces]
+			if r.Verifiable && r.Reproduces != nil {
+				mark = map[bool]string{true: "✓", false: "✗"}[*r.Reproduces]
 			}
 			label := r.Kind
 			if !r.Verifiable {
@@ -258,6 +272,11 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 	}
 	if failed > 0 {
 		return fmt.Errorf("replay: %d of %d step(s) did not reproduce", failed, checked)
+	}
+	if checked == 0 {
+		// F2: vacuous success is CI poison — a session with nothing verifiable
+		// (pull-only, or fingerprint-less SQL) must not report "reproduces".
+		return fmt.Errorf("replay: 0 of %d step(s) verifiable — nothing was confirmed (pull steps and fingerprint-less SQL carry no fingerprint)", len(steps))
 	}
 	return nil
 }

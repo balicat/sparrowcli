@@ -2,7 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -27,6 +31,31 @@ func TestRedactArgv(t *testing.T) {
 		if got := redactArgv(c.in); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("redactArgv(%v) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// A BOM'd, CRLF, pull-only session file: the BOM must be tolerated (F3), and
+// zero verifiable steps must NOT exit 0 (F2) — and neither needs a server.
+func TestReplayVacuousSessionFails(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "s.jsonl")
+	step := `{"ts":"t","argv":["pull","x"],"endpoint":"grpc://nowhere:1","kind":"pull","ticket":"{}","rows":5,"ms":1}`
+	if err := os.WriteFile(f, []byte("\xef\xbb\xbf"+step+"\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := cmdReplay([]string{f})
+	if err == nil {
+		t.Fatal("replay of a session with no verifiable steps must not succeed")
+	}
+	var ue usageError
+	if errors.As(err, &ue) {
+		t.Errorf("BOM/CRLF misread as a usage error: %v", err)
+	}
+	var ce connError
+	if errors.As(err, &ce) {
+		t.Errorf("nothing verifiable — no dial should have happened: %v", err)
+	}
+	if !strings.Contains(err.Error(), "verifiable") {
+		t.Errorf("want the nothing-confirmed message, got: %v", err)
 	}
 }
 

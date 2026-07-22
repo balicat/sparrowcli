@@ -42,7 +42,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow check <table>` | data doctor: nulls, duplicate keys, staleness, frozen series, outliers. `--strict` fails on warnings · `--fail-on keys,nulls` gates the exit on named checks only (the rest still report) · `--show-violations` emits offending keys+values · `--approx` = memory-safe (HLL) uniqueness · `--explain` echoes each stage's SQL · `--baseline prior.json` gates on regressions | server-side SQL aggregates — the table is never downloaded |
 | `sparrow expect '<sql>' --eq N` \| `--rows 0` \| `--cols a,b` | assert something about a query and exit 1 if it fails — an agent's self-authored **data contract**. Scalar (`--eq/--ne/--gt/--lt/--ge/--le`, numeric-aware), row-count (`--rows/--rows-min/--rows-max/--empty/--nonempty`, wrapped in `COUNT(*)`), or shape (`--cols`, names in order); any combination, all must hold | one query (counts never materialize) |
 | `sparrow verify <receipt.json>` | re-run a receipt's query and confirm the result fingerprint still matches (`sql --receipt r.json` writes one) — **provable provenance**: exit 0 = the number is real, exit 1 = changed/tampered. `-s` verifies the same query against another server | one server-side fingerprint aggregate |
-| `sparrow replay <session.jsonl>` | re-run a recorded **investigation** and confirm every step reproduces (set `SPARROW_SESSION=file` and each read appends a fingerprinted step) — exit 1 if any drifted. `-s` replays the whole thing against another server | one fingerprint aggregate per step |
+| `sparrow replay <session.jsonl>` | re-run a recorded **investigation** and confirm every step reproduces (set `SPARROW_SESSION=file` and each read appends a fingerprinted step) — exit 1 if any drifted, or if nothing in the file was verifiable. `-s` replays the whole thing against another server | one fingerprint aggregate per step |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper, **catalog writes (CREATE/DROP)**. Exit 1 if exposed | benign probes (incl. a create-then-drop round-trip); run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
@@ -369,10 +369,12 @@ sparrow replay probe.jsonl
 
 `sparrow replay` re-runs each SQL step against its endpoint and diffs the
 fingerprint — **exit 0** if the investigation still holds, **exit 1** if any
-step drifted (it names which, and whether the row count or the content changed).
+step drifted (it names which, and whether the row count, the content, or the
+column names changed) — or if the file has no verifiable steps at all, so CI
+gating on `replay && …` can't be fooled by a pull-only session.
 `replay -s <other>` runs the entire investigation against a different server —
 "how I arrived at this" turned into a regression test you (or a reviewer, or CI)
-can re-run. Pull/head steps are recorded for the narrative but marked rows-only
+can re-run. Pull steps are recorded for the narrative but marked "not checked"
 (no server-side fingerprint). It's the reusable-ticket idea lifted from one
 query to a whole exploration.
 
