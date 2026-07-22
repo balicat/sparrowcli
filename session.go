@@ -34,6 +34,34 @@ type sessionStep struct {
 
 func sessionPath() string { return strings.TrimSpace(os.Getenv("SPARROW_SESSION")) }
 
+// redactArgv masks the values of credential-bearing flags (--basic user:pass,
+// --bearer token, --encrypt-key, --header k=v) in the recorded argv. A session
+// file is meant to be handed around and replayed by someone else — secrets must
+// not ride along. Argv is informational only; replay never re-parses it.
+func redactArgv(args []string) []string {
+	sensitive := func(name string) bool {
+		switch strings.TrimLeft(name, "-") {
+		case "basic", "bearer", "encrypt-key", "header":
+			return true
+		}
+		return false
+	}
+	out := make([]string, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if k, _, found := strings.Cut(a, "="); found && strings.HasPrefix(a, "-") && sensitive(k) {
+			out[i] = k + "=***"
+			continue
+		}
+		out[i] = a
+		if strings.HasPrefix(a, "-") && sensitive(a) && i+1 < len(args) {
+			i++
+			out[i] = "***"
+		}
+	}
+	return out
+}
+
 // recordSession appends one step to the SPARROW_SESSION file (no-op if unset).
 // For SQL it also computes the content fingerprint (one extra aggregate on the
 // already-open connection) so replay can verify, not just re-count. Best-effort:
@@ -44,7 +72,7 @@ func recordSession(ctx context.Context, cl *flightsql.Client, query string, tick
 		return
 	}
 	step := sessionStep{
-		TS: isoNow(), Argv: os.Args[1:], Endpoint: endpoint, Rows: rows, Ms: ms,
+		TS: isoNow(), Argv: redactArgv(os.Args[1:]), Endpoint: endpoint, Rows: rows, Ms: ms,
 	}
 	if query != "" {
 		step.Kind, step.Query = "sql", strings.TrimSpace(query)
@@ -76,8 +104,9 @@ Re-run a recorded session and confirm each step still reproduces. A session is
 written by any command run with SPARROW_SESSION=<file> set — every read appends
 a step (query + endpoint + row count + a content fingerprint for SQL). replay
 re-runs each SQL step and diffs its fingerprint: exit 0 if the whole
-investigation reproduces, 1 if any step drifted. -s overrides every step's
-endpoint (replay the investigation against a different server).
+investigation reproduces, 1 if any step drifted, 2 if a server couldn't be
+reached or authenticated. -s overrides every step's endpoint (replay the
+investigation against a different server).
 examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_data"
           sparrow replay probe.jsonl                 # …does it still hold?
           sparrow replay probe.jsonl -s gizmo        # …on another server?`)
@@ -171,9 +200,13 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 		checked++
 		now, err := fpAt(s.Endpoint, s.Query)
 		if err != nil {
+			// Dial errors arrive wrapped in connError; bearer/no-auth failures
+			// surface at fingerprint time instead (dial sends no RPC), so
+			// classify those too (verify's R3c, applied here): couldn't check
+			// is exit 2, NOT "didn't reproduce".
 			var ce connError
-			if errors.As(err, &ce) {
-				return err // connection/auth → exit 2
+			if errors.As(err, &ce) || errors.As(classifyConnErr(err, err), &ce) {
+				return connError{fmt.Errorf("replay step %d: %s", i+1, firstLine(err))}
 			}
 			r.Reproduces, r.Detail = false, "re-run failed: "+firstLine(err)
 			failed++
@@ -213,13 +246,13 @@ examples: SPARROW_SESSION=probe.jsonl sparrow sql "SELECT count(*) FROM series_d
 			}
 			label := r.Kind
 			if !r.Verifiable {
-				label = r.Kind + " (rows-only)"
+				label = r.Kind + " (not checked)"
 			}
 			fmt.Printf(" %s step %d  %-16s %s\n", mark, r.Step, label, r.Detail)
 		}
 		fmt.Printf("\n%d/%d verifiable steps reproduce", checked-failed, checked)
 		if len(steps) > checked {
-			fmt.Printf(" (%d pull/head step(s) not fingerprinted)", len(steps)-checked)
+			fmt.Printf(" (%d step(s) not fingerprinted)", len(steps)-checked)
 		}
 		fmt.Println()
 	}
