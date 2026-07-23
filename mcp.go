@@ -49,11 +49,12 @@ func cmdMCP(args []string) error {
 Serve this CLI's core tools over the Model Context Protocol (stdio) — for
 chat agents without a shell (Claude Desktop, claude.ai, Slack). Binds ONE
 server (the profile/URI given here); the connection is dialed lazily on the
-first tool call and kept warm across calls. Data tools: orient, sql, pull,
-expect, verify. Client-side tools: version, whatsnew, feedback (these need no
-Flight server). Row output is capped (--max-rows, default 200, hard cap 2000)
-so a result can't flood a model's context window. stdout carries only
-protocol frames; logs go to stderr.
+first tool call and kept warm across calls. Data tools: orient, sql (incl.
+stats benchmark mode), pull, expect, verify. Diagnostics: doctor (+ server
+conformance card), check, ping. Client-side: version, whatsnew, feedback
+(these need no Flight server). Row output is capped (--max-rows, default 200,
+hard cap 2000) so a result can't flood a model's context window. stdout
+carries only protocol frames; logs go to stderr.
 example (claude_desktop_config.json):
   { "mcpServers": { "sparrow": { "command": "sparrow", "args": ["mcp", "-s", "sparrow"] } } }`)
 	cf := addConnFlags(fs)
@@ -64,7 +65,7 @@ example (claude_desktop_config.json):
 	if err != nil {
 		return err
 	}
-	srv := &mcpServer{profile: p, pname: pname, defaultCap: clampRows(*maxRows)}
+	srv := &mcpServer{profile: p, pname: pname, defaultCap: clampRows(*maxRows), connArgs: cf.asArgs()}
 	fmt.Fprintf(os.Stderr, "sparrow mcp: serving %s (profile: %s) on stdio\n", p.URI, pname)
 	defer srv.closeClient()
 	return srv.serve(os.Stdin, os.Stdout)
@@ -84,7 +85,8 @@ type mcpServer struct {
 	profile    Profile
 	pname      string
 	defaultCap int
-	clientName string // from initialize clientInfo — attributes feedback reports
+	clientName string   // from initialize clientInfo — attributes feedback reports
+	connArgs   []string // the startup binding replayed as CLI flags, for captured commands
 
 	mu      sync.Mutex // guards cl/clCtx (dial + drop)
 	cl      *flightsql.Client
@@ -142,6 +144,92 @@ func (s *mcpServer) withClient(fn func(ctx context.Context, cl *flightsql.Client
 		return run()
 	}
 	return err
+}
+
+// asArgs replays the parsed connection flags as CLI arguments, so a captured
+// command (doctor/check/ping run in-process) targets the SAME binding the MCP
+// server was started with.
+func (cf *connFlags) asArgs() []string {
+	var a []string
+	if *cf.server != "" {
+		a = append(a, "-s", *cf.server)
+	}
+	if *cf.basic != "" {
+		a = append(a, "--basic", *cf.basic)
+	}
+	if *cf.bearer != "" {
+		a = append(a, "--bearer", *cf.bearer)
+	}
+	for _, h := range cf.hdrs {
+		a = append(a, "--header", h)
+	}
+	if *cf.tlsSkip {
+		a = append(a, "--tls-skip-verify")
+	}
+	if *cf.cert != "" {
+		a = append(a, "--tls-cert", *cf.cert)
+	}
+	if *cf.key != "" {
+		a = append(a, "--tls-key", *cf.key)
+	}
+	if *cf.ca != "" {
+		a = append(a, "--tls-ca", *cf.ca)
+	}
+	return a
+}
+
+// runCaptured executes a CLI command function in-process with real args,
+// capturing everything it prints. Safe here because (a) the request loop is
+// serial and (b) the protocol writer holds the ORIGINAL stdout *os.File —
+// swapping the os.Stdout variable cannot touch frames already in flight.
+// User-supplied values must be dash-guarded first: parseFlags os.Exit(3)s on
+// an unknown flag, which would kill the whole server.
+func runCaptured(fn func([]string) error, args []string) (stdout, stderr string, err error) {
+	origOut, origErr := os.Stdout, os.Stderr
+	ro, wo, e1 := os.Pipe()
+	re, we, e2 := os.Pipe()
+	if e1 != nil || e2 != nil {
+		return "", "", fmt.Errorf("pipe: %v %v", e1, e2)
+	}
+	outC := make(chan string, 1)
+	errC := make(chan string, 1)
+	go func() { b, _ := io.ReadAll(ro); outC <- string(b) }()
+	go func() { b, _ := io.ReadAll(re); errC <- string(b) }()
+	os.Stdout, os.Stderr = wo, we
+	defer func() {
+		os.Stdout, os.Stderr = origOut, origErr
+		wo.Close()
+		we.Close()
+		stdout, stderr = <-outC, <-errC
+	}()
+	err = fn(args)
+	return
+}
+
+// capturedResult applies the expect/verify philosophy to captured commands:
+// if the command produced its report, the report IS the answer — a doctor
+// that found failures or a check with findings is a successful diagnosis,
+// not a tool error (the command's gate verdict rides as a footer line). Only
+// a command that produced NOTHING surfaces its error as isError.
+func capturedResult(stdout string, err error) (string, error) {
+	if strings.TrimSpace(stdout) != "" {
+		if err != nil {
+			return stdout + "\ngate: " + firstLine(err) + "\n", nil
+		}
+		return stdout, nil
+	}
+	return "", err
+}
+
+// dashGuard rejects user-supplied positional values that would be parsed as
+// flags by the captured command (see runCaptured).
+func dashGuard(vals ...string) error {
+	for _, v := range vals {
+		if strings.HasPrefix(strings.TrimSpace(v), "-") {
+			return fmt.Errorf("value %q must not start with '-'", v)
+		}
+	}
+	return nil
 }
 
 // ── JSON-RPC plumbing ────────────────────────────────────────────────────
@@ -208,10 +296,12 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 					"version": version,
 				},
 				"instructions": "ONE bound Flight SQL server (" + s.profile.URI + "). Data tools: " +
-					"start with orient (the map), then sql for queries (markdown table, row-capped), " +
-					"pull for 1-RTT ready tickets, expect to assert a contract, verify to check a receipt. " +
-					"Client-side tools: version (this server + binding), whatsnew (recent releases), and " +
-					"feedback — reach the sparrow maintainers (no Flight server needed) when a tool " +
+					"start with orient (the map), then sql for queries (markdown table, row-capped; " +
+					"stats:true = wire-anatomy benchmark), pull for 1-RTT ready tickets, expect to assert " +
+					"a contract, verify to check a receipt. Diagnostics: doctor (layered connection " +
+					"diagnosis; server_card:true = conformance card), check (data-quality findings), " +
+					"ping (network vs server latency). Client-side: version, whatsnew (recent releases), " +
+					"and feedback — reach the sparrow maintainers (no Flight server needed) when a tool " +
 					"misbehaves or an idea comes up. Same verbs, same semantics as the sparrow CLI.",
 			})
 		case "ping":
@@ -267,10 +357,13 @@ func mcpToolDefs() []map[string]any {
 		{
 			"name": "sql",
 			"description": cmdDesc["sql"] + " and return the result as a markdown table (row-capped). " +
-				"Read-only queries; the server may reject writes.",
+				"Read-only queries; the server may reject writes. With stats:true the result is instead the " +
+				"query's ANATOMY — plan/first-byte/stream ms, wire bytes, codec + compression ratio, pacing — " +
+				"the CLI's --stats benchmark (runs on its own fresh connection, full stream measured).",
 			"inputSchema": obj(map[string]any{
 				"query":    map[string]any{"type": "string", "description": "the SQL statement"},
 				"max_rows": maxRowsProp,
+				"stats":    map[string]any{"type": "boolean", "description": "return the wire anatomy instead of rows (benchmark mode)"},
 			}, "query"),
 		},
 		{
@@ -325,6 +418,37 @@ func mcpToolDefs() []map[string]any {
 			}, "message"),
 		},
 		{
+			"name": "doctor",
+			"description": cmdDesc["doctor"] + ": config → dns → tcp → tls → auth → flightsql → roundtrip, " +
+				"naming the layer that breaks — run this when a data tool reports the server unreachable. " +
+				"With server_card:true it instead probes the server's Flight SQL CONFORMANCE surface " +
+				"(catalog RPCs, prepared statements, Substrait, direct tickets, IPC compression). JSON report.",
+			"inputSchema": obj(map[string]any{
+				"server_card": map[string]any{"type": "boolean", "description": "probe the server's Flight SQL surface instead of the connection"},
+			}),
+		},
+		{
+			"name": "check",
+			"description": cmdDesc["check"] + " — nulls, duplicate keys, staleness, frozen series, outliers; " +
+				"server-side aggregates, JSON findings. ⚠ heavy on very large tables (full-table GROUP BYs): " +
+				"prefer key columns with sane cardinality and avoid hammering small production servers.",
+			"inputSchema": obj(map[string]any{
+				"table":   map[string]any{"type": "string", "description": "the table to check"},
+				"key":     map[string]any{"type": "string", "description": "key column(s), comma-separated — enables duplicate-key checks"},
+				"time":    map[string]any{"type": "string", "description": "time column — enables staleness/frozen checks"},
+				"max_age": map[string]any{"type": "string", "description": `staleness threshold, e.g. "7d"`},
+				"fail_on": map[string]any{"type": "string", "description": "gate only these named checks (comma list); the rest still report"},
+			}, "table"),
+		},
+		{
+			"name": "ping",
+			"description": cmdDesc["ping"] + " — separates network latency from server time " +
+				"(bare TCP median vs warm-RPC median). JSON percentiles.",
+			"inputSchema": obj(map[string]any{
+				"n": map[string]any{"type": "integer", "description": "rounds (default 5)"},
+			}),
+		},
+		{
 			"name":        "version",
 			"description": cmdDesc["version"] + " of this sparrow MCP server, and which Flight SQL endpoint it is bound to.",
 			"inputSchema": obj(map[string]any{}),
@@ -359,6 +483,51 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 		text, err = s.toolExpect(args)
 	case "verify":
 		text, err = s.toolVerify(args)
+	case "doctor":
+		var a struct {
+			ServerCard bool `json:"server_card"`
+		}
+		json.Unmarshal(args, &a)
+		cargs := append(append([]string{}, s.connArgs...), "-o", "json")
+		if a.ServerCard {
+			cargs = append(cargs, "--server")
+		}
+		stdout, _, cerr := runCaptured(cmdDoctor, cargs)
+		text, err = capturedResult(stdout, cerr)
+	case "check":
+		var a struct {
+			Table  string `json:"table"`
+			Key    string `json:"key"`
+			Time   string `json:"time"`
+			MaxAge string `json:"max_age"`
+			FailOn string `json:"fail_on"`
+		}
+		if json.Unmarshal(args, &a) != nil || strings.TrimSpace(a.Table) == "" {
+			return `check needs {"table": "..."}`, true, true
+		}
+		if gerr := dashGuard(a.Table, a.Key, a.Time, a.MaxAge, a.FailOn); gerr != nil {
+			return firstLine(gerr), true, true
+		}
+		cargs := append(append([]string{}, s.connArgs...), a.Table, "-o", "json")
+		for _, f := range []struct{ flag, v string }{
+			{"key", a.Key}, {"time", a.Time}, {"max-age", a.MaxAge}, {"fail-on", a.FailOn}} {
+			if strings.TrimSpace(f.v) != "" {
+				cargs = append(cargs, "--"+f.flag, f.v)
+			}
+		}
+		stdout, _, cerr := runCaptured(cmdCheck, cargs)
+		text, err = capturedResult(stdout, cerr)
+	case "ping":
+		var a struct {
+			N int `json:"n"`
+		}
+		json.Unmarshal(args, &a)
+		cargs := append(append([]string{}, s.connArgs...), "-o", "json")
+		if a.N > 0 {
+			cargs = append(cargs, "-n", strconv.Itoa(a.N))
+		}
+		stdout, _, cerr := runCaptured(cmdPing, cargs)
+		text, err = capturedResult(stdout, cerr)
 	case "feedback":
 		text, err = s.toolFeedback(args)
 	case "version":
@@ -387,9 +556,27 @@ func (s *mcpServer) toolSQL(raw json.RawMessage) (string, error) {
 	var a struct {
 		Query   string `json:"query"`
 		MaxRows int    `json:"max_rows"`
+		Stats   bool   `json:"stats"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Query) == "" {
 		return "", fmt.Errorf(`sql needs {"query": "SELECT ..."}`)
+	}
+	if a.Stats {
+		// benchmark mode: the CLI's --stats anatomy, on its own fresh
+		// connection with the wire counter attached; the data itself goes to
+		// a temp file and is discarded — the anatomy (stderr) is the answer
+		if err := dashGuard(a.Query); err != nil {
+			return "", err
+		}
+		tmp, err := os.CreateTemp("", "sparrow-mcp-*.csv")
+		if err != nil {
+			return "", err
+		}
+		tmp.Close()
+		defer os.Remove(tmp.Name())
+		cargs := append(append([]string{}, s.connArgs...), a.Query, "--stats", "-o", tmp.Name())
+		_, stderrTxt, cerr := runCaptured(cmdSQL, cargs)
+		return capturedResult(stderrTxt, cerr)
 	}
 	limit := s.defaultCap
 	if a.MaxRows > 0 {

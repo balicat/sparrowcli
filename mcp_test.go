@@ -48,8 +48,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Errorf("serverInfo wrong: %v", si)
 	}
 	tools := frames[1]["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 8 {
-		t.Fatalf("want 8 tools, got %d", len(tools))
+	if len(tools) != 11 {
+		t.Fatalf("want 11 tools, got %d", len(tools))
 	}
 	for _, tl := range tools {
 		m := tl.(map[string]any)
@@ -121,5 +121,25 @@ func TestMCPErrors(t *testing.T) {
 	vtext := res["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(vtext, version) || !strings.Contains(vtext, "grpc://test:1") {
 		t.Errorf("version text missing version/binding: %q", vtext)
+	}
+}
+
+// a table name that would parse as a FLAG must be rejected before the
+// captured command runs — parseFlags os.Exit(3)s on unknown flags, which
+// would kill the whole server (the dash guard is load-bearing).
+func TestMCPDashGuard(t *testing.T) {
+	frames := mcpSession(t,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check","arguments":{"table":"--evil"}}}`,
+	)
+	if len(frames) != 1 {
+		t.Fatalf("want 1 frame, got %d", len(frames))
+	}
+	res, ok := frames[0]["result"].(map[string]any)
+	if !ok || res["isError"] != true {
+		t.Fatalf("dash-guarded table must be an isError result (and the server must survive): %v", frames[0])
+	}
+	txt := res["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(txt, "must not start with '-'") {
+		t.Errorf("guard message missing: %q", txt)
 	}
 }
