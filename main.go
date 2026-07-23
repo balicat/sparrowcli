@@ -1797,16 +1797,28 @@ example: sparrow orient -s gizmo`)
 	}
 	defer cl.Close()
 
+	md, err := orientMarkdown(ctx, cl, p.URI, pname)
+	if err != nil {
+		return err
+	}
+	fmt.Print(md)
+	return nil
+}
+
+// orientMarkdown builds the orient map as a string — shared by the CLI
+// command (prints it) and the MCP orient tool (returns it as tool content).
+func orientMarkdown(ctx context.Context, cl *flightsql.Client, uri, pname string) (string, error) {
+	var out strings.Builder
 	vendor := probeVendor(ctx, cl)
 	if vendor == "" {
 		vendor = "Flight SQL server (vendor info unsupported)"
 	}
-	fmt.Printf("# %s\n\n", vendor)
-	fmt.Printf("endpoint: `%s` (profile: %s)\n\n", p.URI, pname)
+	fmt.Fprintf(&out, "# %s\n\n", vendor)
+	fmt.Fprintf(&out, "endpoint: `%s` (profile: %s)\n\n", uri, pname)
 
 	info, err := cl.GetTables(ctx, &flightsql.GetTablesOpts{IncludeSchema: true})
 	if err != nil {
-		return err
+		return "", err
 	}
 	type tbl struct {
 		catalog, schema, name, typ string
@@ -1816,7 +1828,7 @@ example: sparrow orient -s gizmo`)
 	for _, ep := range info.Endpoint {
 		rdr, err := cl.DoGet(ctx, ep.Ticket)
 		if err != nil {
-			return err
+			return "", err
 		}
 		for rdr.Next() {
 			rec := rdr.Record()
@@ -1856,47 +1868,46 @@ example: sparrow orient -s gizmo`)
 		err = rdr.Err()
 		rdr.Release()
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	if len(tables) == 0 {
-		fmt.Println("no tables visible (GetTables returned nothing)")
-		return nil
+		return "no tables visible (GetTables returned nothing)\n", nil
 	}
 
-	fmt.Println("## tables")
-	fmt.Println()
-	fmt.Println("| catalog | schema | table | type |")
-	fmt.Println("| --- | --- | --- | --- |")
+	fmt.Fprintln(&out, "## tables")
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "| catalog | schema | table | type |")
+	fmt.Fprintln(&out, "| --- | --- | --- | --- |")
 	for _, t := range tables {
-		fmt.Printf("| %s | %s | %s | %s |\n", t.catalog, t.schema, t.name, t.typ)
+		fmt.Fprintf(&out, "| %s | %s | %s | %s |\n", t.catalog, t.schema, t.name, t.typ)
 	}
 	for _, t := range tables {
 		if t.arrow == nil || t.arrow.NumFields() == 0 {
 			continue // Dremio returns empty schemas in GetTables — skip the noise
 		}
-		fmt.Printf("\n## %s\n\n", t.name)
-		fmt.Println("| column | type | nullable |")
-		fmt.Println("| --- | --- | --- |")
+		fmt.Fprintf(&out, "\n## %s\n\n", t.name)
+		fmt.Fprintln(&out, "| column | type | nullable |")
+		fmt.Fprintln(&out, "| --- | --- | --- |")
 		for _, f := range t.arrow.Fields() {
 			null := ""
 			if f.Nullable {
 				null = "yes"
 			}
-			fmt.Printf("| %s | %s | %s |\n", f.Name, f.Type, null)
+			fmt.Fprintf(&out, "| %s | %s | %s |\n", f.Name, f.Type, null)
 		}
 		// A MACRO is a function, not a table — a bare SELECT * FROM it
 		// errors. Teach the call shape right where it's discovered (the
 		// generic "SELECT ... LIMIT 20" footer would mislead here).
 		if strings.EqualFold(t.typ, "MACRO") {
-			fmt.Printf("\na table macro — CALL it with arguments: `SELECT * FROM %s('...')` "+
+			fmt.Fprintf(&out, "\na table macro — CALL it with arguments: `SELECT * FROM %s('...')` "+
 				"(a bare `SELECT * FROM %s` errors; argument names: "+
 				"`SELECT parameters FROM duckdb_functions() WHERE function_name='%s'`)\n",
 				t.name, t.name, t.name)
 		}
 	}
-	fmt.Println("\nnext: `sparrow info <table>` for a row count · `sparrow sql \"SELECT ... LIMIT 20\" -o md` to look at data (macros: call with args instead)")
-	return nil
+	fmt.Fprintln(&out, "\nnext: `sparrow info <table>` for a row count · `sparrow sql \"SELECT ... LIMIT 20\" -o md` to look at data (macros: call with args instead)")
+	return out.String(), nil
 }
 
 func groupDigits(s string) string {
@@ -2745,6 +2756,7 @@ usage:
   sparrow profiles [use <name> | rm <name>]
   sparrow completion bash|zsh|fish                shell tab-completion script
   sparrow agent                                   print a complete agent-ready manual (markdown) for driving sparrow
+  sparrow mcp [-s profile]                        serve orient/sql/pull/expect/verify over MCP stdio — for chat agents without a shell
   sparrow version
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
@@ -2791,6 +2803,8 @@ func main() {
 		err = cmdVerify(os.Args[2:])
 	case "replay":
 		err = cmdReplay(os.Args[2:])
+	case "mcp":
+		err = cmdMCP(os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
 	case "audit":
@@ -2841,6 +2855,8 @@ func main() {
 				err = cmdVerify([]string{"-h"})
 			case "replay":
 				err = cmdReplay([]string{"-h"})
+			case "mcp":
+				err = cmdMCP([]string{"-h"})
 			case "diff":
 				err = cmdDiff([]string{"-h"})
 			case "audit":

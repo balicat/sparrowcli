@@ -39,6 +39,7 @@ var cmdDesc = map[string]string{
 	"profiles":   "list / use / rm saved profiles",
 	"completion": "print a shell completion script",
 	"agent":      "print a complete agent-ready manual (markdown)",
+	"mcp":        "serve the core tools over MCP stdio — for chat agents without a shell",
 	"ticket":     "emit a reusable pull ticket (JSON) to save and replay",
 	"version":    "print version",
 	"help":       "help for a command",
@@ -67,6 +68,7 @@ var cmdOwnFlags = map[string][]string{
 	"profiles":   {},
 	"completion": {},
 	"agent":      {"json"},
+	"mcp":        {"max-rows"},
 	"ticket":     {"series", "start", "end", "pretty"},
 	"version":    {},
 	"help":       {},
@@ -77,6 +79,7 @@ var serverCmds = map[string]bool{
 	"connect": true, "orient": true, "ls": true, "info": true, "sql": true,
 	"query": true, "head": true, "pull": true, "profile": true, "doctor": true, "check": true,
 	"expect": true, "verify": true, "replay": true, "diff": true, "audit": true, "ping": true,
+	"mcp": true,
 }
 
 func completionCommands() []string {
