@@ -283,7 +283,8 @@ sparrow profile <table> -o json            # per-column nulls / approx-distinct 
 | ` + "`expect \"<sql>\"`" + ` | assert a query result (--eq/--rows/--empty/--cols); exit 1 on violation |
 | ` + "`verify <receipt>`" + ` | re-run a receipt's query, confirm the fingerprint matches (` + "`sql --receipt`" + ` writes one) |
 | ` + "`replay <session>`" + ` | re-run a recorded investigation (SPARROW_SESSION=file), confirm every step reproduces |
-| ` + "`mcp [-s profile]`" + ` | serve orient/sql/pull/expect/verify over MCP stdio — for hosts WITHOUT a shell (Claude Desktop etc.); this manual is for shell agents, same verbs there |
+| ` + "`mcp [-s profile]`" + ` | serve orient/sql/pull/expect/verify (+ version/whatsnew/feedback) over MCP stdio — for hosts WITHOUT a shell (Claude Desktop etc.); this manual is for shell agents, same verbs there |
+| ` + "`whatsnew [-n N]`" + ` | recent release notes, live from the releases feed |
 | ` + "`diff <t> --against`" + ` | drift gate vs a second server |
 | ` + "`audit`" + ` | security surface of a server you operate |
 | ` + "`ping`" + ` | latency percentiles: network vs server |

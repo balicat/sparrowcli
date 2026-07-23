@@ -49,10 +49,11 @@ func cmdMCP(args []string) error {
 Serve this CLI's core tools over the Model Context Protocol (stdio) — for
 chat agents without a shell (Claude Desktop, claude.ai, Slack). Binds ONE
 server (the profile/URI given here); the connection is dialed lazily on the
-first tool call and kept warm across calls. Tools: orient, sql, pull, expect,
-verify. Row output is capped (--max-rows, default 200, hard cap 2000) so a
-result can't flood a model's context window. stdout carries only protocol
-frames; logs go to stderr.
+first tool call and kept warm across calls. Data tools: orient, sql, pull,
+expect, verify. Client-side tools: version, whatsnew, feedback (these need no
+Flight server). Row output is capped (--max-rows, default 200, hard cap 2000)
+so a result can't flood a model's context window. stdout carries only
+protocol frames; logs go to stderr.
 example (claude_desktop_config.json):
   { "mcpServers": { "sparrow": { "command": "sparrow", "args": ["mcp", "-s", "sparrow"] } } }`)
 	cf := addConnFlags(fs)
@@ -83,6 +84,7 @@ type mcpServer struct {
 	profile    Profile
 	pname      string
 	defaultCap int
+	clientName string // from initialize clientInfo — attributes feedback reports
 
 	mu      sync.Mutex // guards cl/clCtx (dial + drop)
 	cl      *flightsql.Client
@@ -188,12 +190,16 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 		case "initialize":
 			var p struct {
 				ProtocolVersion string `json:"protocolVersion"`
+				ClientInfo      struct {
+					Name string `json:"name"`
+				} `json:"clientInfo"`
 			}
 			json.Unmarshal(req.Params, &p)
 			pv := p.ProtocolVersion
 			if pv == "" {
 				pv = mcpProtocolVersion
 			}
+			s.clientName = strings.TrimSpace(p.ClientInfo.Name)
 			s.writeResult(w, req.ID, map[string]any{
 				"protocolVersion": pv,
 				"capabilities":    map[string]any{"tools": map[string]any{}},
@@ -201,10 +207,12 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 					"name": "sparrow", "title": "Sparrow — Flight SQL",
 					"version": version,
 				},
-				"instructions": "Five tools over ONE bound Flight SQL server (" + s.profile.URI + "): " +
+				"instructions": "ONE bound Flight SQL server (" + s.profile.URI + "). Data tools: " +
 					"start with orient (the map), then sql for queries (markdown table, row-capped), " +
 					"pull for 1-RTT ready tickets, expect to assert a contract, verify to check a receipt. " +
-					"Same verbs, same semantics as the sparrow CLI.",
+					"Client-side tools: version (this server + binding), whatsnew (recent releases), and " +
+					"feedback — reach the sparrow maintainers (no Flight server needed) when a tool " +
+					"misbehaves or an idea comes up. Same verbs, same semantics as the sparrow CLI.",
 			})
 		case "ping":
 			s.writeResult(w, req.ID, map[string]any{})
@@ -305,6 +313,30 @@ func mcpToolDefs() []map[string]any {
 				"receipt": map[string]any{"type": "string", "description": "the receipt JSON document (contents of the .json file sparrow sql --receipt wrote)"},
 			}, "receipt"),
 		},
+		{
+			"name": "feedback",
+			"description": cmdDesc["feedback"] + " — reaches them over HTTPS, independent of the Flight server " +
+				"(works even when the server is down, which is exactly when you need it). " +
+				"USE IT when a sparrow tool misbehaves or an idea comes up mid-session.",
+			"inputSchema": obj(map[string]any{
+				"message":  map[string]any{"type": "string", "description": "what happened, or the idea"},
+				"category": map[string]any{"type": "string", "enum": []string{"bug", "idea", "general"}, "description": "defaults to general"},
+				"from":     map[string]any{"type": "string", "description": "who this is from (defaults to the connected MCP client's name)"},
+			}, "message"),
+		},
+		{
+			"name":        "version",
+			"description": cmdDesc["version"] + " of this sparrow MCP server, and which Flight SQL endpoint it is bound to.",
+			"inputSchema": obj(map[string]any{}),
+		},
+		{
+			"name": "whatsnew",
+			"description": cmdDesc["whatsnew"] + " — the notes are generated from the shipped commits, " +
+				"so this is always the released truth, not a maintained changelog.",
+			"inputSchema": obj(map[string]any{
+				"n": map[string]any{"type": "integer", "description": "how many releases to show (default 3, max 20)"},
+			}),
+		},
 	}
 }
 
@@ -327,6 +359,19 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 		text, err = s.toolExpect(args)
 	case "verify":
 		text, err = s.toolVerify(args)
+	case "feedback":
+		text, err = s.toolFeedback(args)
+	case "version":
+		text = fmt.Sprintf("sparrow %s · bound to %s (profile: %s) · MCP stdio", versionString(), s.profile.URI, s.pname)
+	case "whatsnew":
+		var a struct {
+			N int `json:"n"`
+		}
+		json.Unmarshal(args, &a)
+		if a.N == 0 {
+			a.N = 3
+		}
+		text, err = whatsnewMarkdown(a.N)
 	default:
 		return "", false, false
 	}
@@ -599,6 +644,36 @@ func (s *mcpServer) toolVerify(raw json.RawMessage) (string, error) {
 		return nil
 	})
 	return out, err
+}
+
+func (s *mcpServer) toolFeedback(raw json.RawMessage) (string, error) {
+	var a struct {
+		Message  string `json:"message"`
+		Category string `json:"category"`
+		From     string `json:"from"`
+	}
+	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Message) == "" {
+		return "", fmt.Errorf(`feedback needs {"message": "..."}`)
+	}
+	if a.Category == "" {
+		a.Category = "general"
+	}
+	user := strings.TrimSpace(a.From)
+	if user == "" {
+		user = s.clientName
+	}
+	if user == "" {
+		user = "mcp-agent"
+	}
+	url := os.Getenv("SPARROW_FEEDBACK_URL")
+	if url == "" {
+		url = feedbackURL
+	}
+	ts, err := sendFeedback(url, strings.TrimSpace(a.Message), a.Category, user, s.profile.URI)
+	if err != nil {
+		return "", err
+	}
+	return "feedback delivered (" + ts + ") — thank you\n", nil
 }
 
 // mcpTable renders rows as a markdown table, capped; fetch limit+1 rows so

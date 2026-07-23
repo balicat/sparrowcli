@@ -43,7 +43,7 @@ sparrow sql "SELECT series_id, COUNT(*) FROM series_data GROUP BY 1 LIMIT 5"
 | `sparrow expect '<sql>' --eq N` \| `--rows 0` \| `--cols a,b` | assert something about a query and exit 1 if it fails — an agent's self-authored **data contract**. Scalar (`--eq/--ne/--gt/--lt/--ge/--le`, numeric-aware), row-count (`--rows/--rows-min/--rows-max/--empty/--nonempty`, wrapped in `COUNT(*)`), or shape (`--cols`, names in order); any combination, all must hold | one query (counts never materialize) |
 | `sparrow verify <receipt.json>` | re-run a receipt's query and confirm the result fingerprint still matches (`sql --receipt r.json` writes one) — **provable provenance**: exit 0 = the number is real, exit 1 = changed/tampered. `-s` verifies the same query against another server | one server-side fingerprint aggregate |
 | `sparrow replay <session.jsonl>` | re-run a recorded **investigation** and confirm every step reproduces (set `SPARROW_SESSION=file` and each read appends a fingerprinted step) — exit 1 if any drifted, or if nothing in the file was verifiable. `-s` replays the whole thing against another server | one fingerprint aggregate per step |
-| `sparrow mcp [-s profile]` | serve **orient / sql / pull / expect / verify** over **MCP stdio** — chat agents without a shell (Claude Desktop, claude.ai) drive the bound Flight server through schema-validated tool calls on ONE warm connection | dialed lazily, kept warm |
+| `sparrow mcp [-s profile]` | serve **orient / sql / pull / expect / verify** (+ client-side **version / whatsnew / feedback**) over **MCP stdio** — chat agents without a shell (Claude Desktop, claude.ai) drive the bound Flight server through schema-validated tool calls on ONE warm connection | dialed lazily, kept warm |
 | `sparrow diff <table> --against <b>` | [drift gate](docs/diff.md): schema, `COUNT(*)`, `--time` bounds, numeric fingerprint vs a second server — exit 1 on drift | conservative aggregates on both sides; nothing downloaded |
 | `sparrow audit` | [security surface](docs/audit.md): what client SQL can reach beyond queries — file reads, dir listing, writes, SSRF, config tamper, **catalog writes (CREATE/DROP)**. Exit 1 if exposed | benign probes (incl. a create-then-drop round-trip); run against a server you operate |
 | `sparrow ping` | separate network latency from server latency, as percentiles | bare TCP connect vs a no-match `GetTables` on the warm channel |
@@ -408,7 +408,10 @@ rest of this section is the summary.
 **No shell? `sparrow mcp`.** Chat agents without a terminal — Claude Desktop,
 claude.ai integrations, Slack — get the same verbs over the Model Context
 Protocol: `sparrow mcp -s <profile>` serves **orient / sql / pull / expect /
-verify** as MCP tools (stdio) against the one server it's bound to. What the
+verify** as MCP tools (stdio) against the one server it's bound to — plus
+**version**, **whatsnew** (release notes, live from the feed), and
+**feedback** (file a bug/idea to the maintainers; needs no Flight server at
+all — reports name the MCP client that filed them). What the
 shape adds over shelling out: a **warm connection** (one dial + auth held
 across calls — a CLI invocation re-dials every time), **schema-validated
 calls** (SQL rides as a JSON field; the shell-quoting failure class is gone),

@@ -48,8 +48,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Errorf("serverInfo wrong: %v", si)
 	}
 	tools := frames[1]["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 5 {
-		t.Fatalf("want 5 tools, got %d", len(tools))
+	if len(tools) != 8 {
+		t.Fatalf("want 8 tools, got %d", len(tools))
 	}
 	for _, tl := range tools {
 		m := tl.(map[string]any)
@@ -80,9 +80,11 @@ func TestMCPErrors(t *testing.T) {
 		`{"jsonrpc":"2.0","method":"notifications/unknown"}`,
 		`{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"no-such-tool","arguments":{}}}`,
 		`{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"sql","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"feedback","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"version","arguments":{}}}`,
 	)
-	if len(frames) != 4 { // parse error, method-not-found, unknown tool, sql-missing-query
-		t.Fatalf("want 4 response frames, got %d: %v", len(frames), frames)
+	if len(frames) != 6 { // parse, method-not-found, unknown tool, sql/feedback missing args, version ok
+		t.Fatalf("want 6 response frames, got %d: %v", len(frames), frames)
 	}
 	code := func(f map[string]any) float64 {
 		e, ok := f["error"].(map[string]any)
@@ -105,5 +107,19 @@ func TestMCPErrors(t *testing.T) {
 	res, ok := frames[3]["result"].(map[string]any)
 	if !ok || res["isError"] != true {
 		t.Errorf("sql with no query must be isError result, got: %v", frames[3])
+	}
+	// feedback with no message errors BEFORE any network send
+	res, ok = frames[4]["result"].(map[string]any)
+	if !ok || res["isError"] != true {
+		t.Errorf("feedback with no message must be isError result, got: %v", frames[4])
+	}
+	// version is pure client-side — works with no reachable server
+	res, ok = frames[5]["result"].(map[string]any)
+	if !ok || res["isError"] == true {
+		t.Fatalf("version must succeed offline, got: %v", frames[5])
+	}
+	vtext := res["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(vtext, version) || !strings.Contains(vtext, "grpc://test:1") {
+		t.Errorf("version text missing version/binding: %q", vtext)
 	}
 }

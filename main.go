@@ -2756,7 +2756,8 @@ usage:
   sparrow profiles [use <name> | rm <name>]
   sparrow completion bash|zsh|fish                shell tab-completion script
   sparrow agent                                   print a complete agent-ready manual (markdown) for driving sparrow
-  sparrow mcp [-s profile]                        serve orient/sql/pull/expect/verify over MCP stdio — for chat agents without a shell
+  sparrow mcp [-s profile]                        serve the core verbs over MCP stdio — for chat agents without a shell
+  sparrow whatsnew [-n N]                         what changed in the last N releases (live from the releases feed)
   sparrow version
 
 output (-o): table · csv · json · jsonl · md · arrow — or a file path:
@@ -2805,6 +2806,8 @@ func main() {
 		err = cmdReplay(os.Args[2:])
 	case "mcp":
 		err = cmdMCP(os.Args[2:])
+	case "whatsnew":
+		err = cmdWhatsnew(os.Args[2:])
 	case "diff":
 		err = cmdDiff(os.Args[2:])
 	case "audit":
@@ -2857,6 +2860,8 @@ func main() {
 				err = cmdReplay([]string{"-h"})
 			case "mcp":
 				err = cmdMCP([]string{"-h"})
+			case "whatsnew":
+				err = cmdWhatsnew([]string{"-h"})
 			case "diff":
 				err = cmdDiff([]string{"-h"})
 			case "audit":

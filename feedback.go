@@ -52,9 +52,20 @@ examples: sparrow feedback "orient saved my day"
 		server = p.URI
 	}
 
+	ts, err := sendFeedback(url, msg, *category, user, server)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ feedback delivered (%s) — thank you\n", ts)
+	return nil
+}
+
+// sendFeedback POSTs one report to the receiver — shared by the CLI command
+// and the MCP feedback tool. Returns the receiver's timestamp.
+func sendFeedback(url, msg, category, user, server string) (string, error) {
 	body, _ := json.Marshal(map[string]string{
 		"message":        msg,
-		"category":       *category,
+		"category":       category,
 		"user":           user,
 		"client_version": "sparrowcli/" + versionString() + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		"server":         server,
@@ -62,7 +73,7 @@ examples: sparrow feedback "orient saved my day"
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return connError{fmt.Errorf("could not reach the feedback receiver: %w", err)}
+		return "", connError{fmt.Errorf("could not reach the feedback receiver: %w", err)}
 	}
 	defer resp.Body.Close()
 	var ack struct {
@@ -71,8 +82,7 @@ examples: sparrow feedback "orient saved my day"
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&ack)
 	if resp.StatusCode != 200 || !ack.OK {
-		return connError{fmt.Errorf("feedback receiver answered %s", resp.Status)}
+		return "", connError{fmt.Errorf("feedback receiver answered %s", resp.Status)}
 	}
-	fmt.Printf("✓ feedback delivered (%s) — thank you\n", ack.TS)
-	return nil
+	return ack.TS, nil
 }
