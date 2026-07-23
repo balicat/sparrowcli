@@ -53,8 +53,11 @@ first tool call and kept warm across calls. Data tools: orient, sql (incl.
 stats benchmark mode), pull, expect, verify. Diagnostics: doctor (+ server
 conformance card), check, ping. Client-side: version, whatsnew, feedback
 (these need no Flight server). Row output is capped (--max-rows, default 200,
-hard cap 2000) so a result can't flood a model's context window. stdout
-carries only protocol frames; logs go to stderr.
+hard cap 2000) so a result can't flood a model's context window. First-class
+MCP: read-only annotations on every tool (hosts can auto-approve; feedback is
+honestly marked outward), sparrow://orient + per-table schema RESOURCES,
+two starter PROMPTS, and typed structuredContent alongside every table/JSON
+result. stdout carries only protocol frames; logs go to stderr.
 example (claude_desktop_config.json):
   { "mcpServers": { "sparrow": { "command": "sparrow", "args": ["mcp", "-s", "sparrow"] } } }`)
 	cf := addConnFlags(fs)
@@ -88,10 +91,11 @@ type mcpServer struct {
 	clientName string   // from initialize clientInfo — attributes feedback reports
 	connArgs   []string // the startup binding replayed as CLI flags, for captured commands
 
-	mu      sync.Mutex // guards cl/clCtx (dial + drop)
-	cl      *flightsql.Client
-	clCtx   context.Context // carries the adopted auth metadata; NO deadline
-	writeMu sync.Mutex      // one protocol frame at a time on stdout
+	mu         sync.Mutex // guards cl/clCtx/tableNames (dial + drop + cache)
+	cl         *flightsql.Client
+	clCtx      context.Context // carries the adopted auth metadata; NO deadline
+	tableNames []string        // resource-list cache (a serving node's catalog is stable)
+	writeMu    sync.Mutex      // one protocol frame at a time on stdout
 }
 
 // client returns the warm connection, dialing on first use. The stored
@@ -329,24 +333,68 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 			s.clientName = strings.TrimSpace(p.ClientInfo.Name)
 			s.writeResult(w, req.ID, map[string]any{
 				"protocolVersion": pv,
-				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"capabilities": map[string]any{
+					"tools": map[string]any{}, "resources": map[string]any{}, "prompts": map[string]any{},
+				},
 				"serverInfo": map[string]any{
 					"name": "sparrow", "title": "Sparrow — Flight SQL",
 					"version": version,
 				},
 				"instructions": "ONE bound Flight SQL server (" + s.profile.URI + "). Data tools: " +
-					"start with orient (the map), then sql for queries (markdown table, row-capped; " +
-					"stats:true = wire-anatomy benchmark), pull for 1-RTT ready tickets, expect to assert " +
-					"a contract, verify to check a receipt. Diagnostics: doctor (layered connection " +
-					"diagnosis; server_card:true = conformance card), check (data-quality findings), " +
-					"ping (network vs server latency). Client-side: version, whatsnew (recent releases), " +
-					"and feedback — reach the sparrow maintainers (no Flight server needed) when a tool " +
-					"misbehaves or an idea comes up. Same verbs, same semantics as the sparrow CLI.",
+					"start with orient (the map — also readable as the sparrow://orient resource), then " +
+					"sql for queries (markdown table, row-capped; stats:true = wire-anatomy benchmark), " +
+					"pull for 1-RTT ready tickets, expect to assert a contract, verify to check a receipt. " +
+					"Diagnostics: doctor (layered connection diagnosis; server_card:true = conformance " +
+					"card), check (data-quality findings), ping (network vs server latency). Client-side: " +
+					"version, whatsnew (recent releases), and feedback — reach the sparrow maintainers " +
+					"(no Flight server needed) when a tool misbehaves or an idea comes up. All tools are " +
+					"read-only against the server (feedback sends a message to the maintainers — the one " +
+					"outward action). Same verbs, same semantics as the sparrow CLI.",
 			})
 		case "ping":
 			s.writeResult(w, req.ID, map[string]any{})
 		case "tools/list":
 			s.writeResult(w, req.ID, map[string]any{"tools": mcpToolDefs()})
+		case "resources/list":
+			rs, err := s.resourceList()
+			if err != nil {
+				s.writeError(w, req.ID, -32603, "resources: "+firstLine(err))
+				continue
+			}
+			s.writeResult(w, req.ID, map[string]any{"resources": rs})
+		case "resources/read":
+			var p struct {
+				URI string `json:"uri"`
+			}
+			if err := json.Unmarshal(req.Params, &p); err != nil || p.URI == "" {
+				s.writeError(w, req.ID, -32602, "resources/read needs a uri")
+				continue
+			}
+			text, err := s.resourceRead(p.URI)
+			if err != nil {
+				s.writeError(w, req.ID, -32002, "resource not found: "+firstLine(err))
+				continue
+			}
+			s.writeResult(w, req.ID, map[string]any{"contents": []map[string]any{
+				{"uri": p.URI, "mimeType": "text/markdown", "text": text}}})
+		case "prompts/list":
+			s.writeResult(w, req.ID, map[string]any{"prompts": mcpPromptDefs()})
+		case "prompts/get":
+			var p struct {
+				Name      string            `json:"name"`
+				Arguments map[string]string `json:"arguments"`
+			}
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				s.writeError(w, req.ID, -32602, "invalid params: "+firstLine(err))
+				continue
+			}
+			msg, ok := s.promptGet(p.Name, p.Arguments)
+			if !ok {
+				s.writeError(w, req.ID, -32602, "unknown prompt: "+p.Name)
+				continue
+			}
+			s.writeResult(w, req.ID, map[string]any{"messages": []map[string]any{
+				{"role": "user", "content": map[string]any{"type": "text", "text": msg}}}})
 		case "tools/call":
 			var p struct {
 				Name      string          `json:"name"`
@@ -356,14 +404,17 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 				s.writeError(w, req.ID, -32602, "invalid params: "+firstLine(err))
 				continue
 			}
-			text, toolErr, known := s.callTool(p.Name, p.Arguments)
+			tr, known := s.callTool(p.Name, p.Arguments)
 			if !known {
 				s.writeError(w, req.ID, -32602, "unknown tool: "+p.Name)
 				continue
 			}
 			res := map[string]any{
-				"content": []map[string]any{{"type": "text", "text": text}},
-				"isError": toolErr,
+				"content": []map[string]any{{"type": "text", "text": tr.text}},
+				"isError": tr.isError,
+			}
+			if tr.structured != nil {
+				res["structuredContent"] = tr.structured
 			}
 			s.writeResult(w, req.ID, res)
 		default:
@@ -376,6 +427,15 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 }
 
 // ── the tool catalog (descriptions embed cmdDesc — pinned by mcp_test.go) ──
+
+// readOnly / outward annotation blocks (tester wish #1): every tool except
+// feedback only READS the bound server, so a host can auto-approve instead of
+// prompting per call. feedback is honestly NOT read-only — it sends a message
+// to the maintainers (the one outward action; hosts should prompt for it).
+// whatsnew reads the public GitHub feed (read-only, but open-world).
+func annReadOnly(title string) map[string]any {
+	return map[string]any{"title": title, "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+}
 
 func mcpToolDefs() []map[string]any {
 	obj := func(props map[string]any, required ...string) map[string]any {
@@ -390,11 +450,13 @@ func mcpToolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "orient",
+			"annotations": annReadOnly("Server map"),
 			"description": cmdDesc["orient"] + ". Call this FIRST on an unfamiliar server.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
 			"name": "sql",
+			"annotations": annReadOnly("Run SQL"),
 			"description": cmdDesc["sql"] + " and return the result as a markdown table (row-capped). " +
 				"Read-only queries; the server may reject writes. With stats:true the result is instead the " +
 				"query's ANATOMY — plan/first-byte/stream ms, wire bytes, codec + compression ratio, pacing — " +
@@ -407,6 +469,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "pull",
+			"annotations": annReadOnly("Direct Pull (1 RTT)"),
 			"description": cmdDesc["pull"] + " — skips SQL planning entirely (1 round trip). " +
 				`Sparrow-dialect JSON tickets: {"series": ["ID", ...], "start": "...", "end": "..."} or {"sql": "SELECT ..."}. ` +
 				"lz4 compression is negotiated automatically. Servers that mint opaque tickets reject this — use sql there.",
@@ -417,6 +480,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "expect",
+			"annotations": annReadOnly("Assert a data contract"),
 			"description": cmdDesc["expect"] + ". Give at least one assertion; ALL must hold. " +
 				"Scalar checks read the first cell; row counts are computed server-side (COUNT(*), never materialized); " +
 				"cols checks the result's column names exactly, in order. A failed assertion is a normal result, not a tool error.",
@@ -438,6 +502,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "verify",
+			"annotations": annReadOnly("Verify a receipt"),
 			"description": cmdDesc["verify"] + " — against THIS server. Pass the receipt document (JSON) itself. " +
 				"If the receipt names a different endpoint, the vendor mismatch is reported but the verdict gates on " +
 				"DATA agreement (the CLI's `verify -s` semantics); on the receipt's own endpoint, server identity gates too.",
@@ -447,6 +512,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "feedback",
+			"annotations": map[string]any{"title": "Message the maintainers", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
 			"description": cmdDesc["feedback"] + " — reaches them over HTTPS, independent of the Flight server " +
 				"(works even when the server is down, which is exactly when you need it). " +
 				"USE IT when a sparrow tool misbehaves or an idea comes up mid-session.",
@@ -458,6 +524,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "doctor",
+			"annotations": annReadOnly("Connection doctor"),
 			"description": cmdDesc["doctor"] + ": config → dns → tcp → tls → auth → flightsql → roundtrip, " +
 				"naming the layer that breaks — run this when a data tool reports the server unreachable. " +
 				"With server_card:true it instead probes the server's Flight SQL CONFORMANCE surface " +
@@ -468,6 +535,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "check",
+			"annotations": annReadOnly("Data-quality check"),
 			"description": cmdDesc["check"] + " — nulls, duplicate keys, staleness, frozen series, outliers; " +
 				"server-side aggregates, JSON findings. ⚠ heavy on very large tables (full-table GROUP BYs): " +
 				"prefer key columns with sane cardinality and avoid hammering small production servers.",
@@ -481,6 +549,7 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name": "ping",
+			"annotations": annReadOnly("Latency ping"),
 			"description": cmdDesc["ping"] + " — separates network latency from server time " +
 				"(bare TCP median vs warm-RPC median). JSON percentiles.",
 			"inputSchema": obj(map[string]any{
@@ -489,11 +558,13 @@ func mcpToolDefs() []map[string]any {
 		},
 		{
 			"name":        "version",
+			"annotations": annReadOnly("Version + binding"),
 			"description": cmdDesc["version"] + " of this sparrow MCP server, and which Flight SQL endpoint it is bound to.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
 			"name": "whatsnew",
+			"annotations": map[string]any{"title": "Recent releases", "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true},
 			"description": cmdDesc["whatsnew"] + " — the notes are generated from the shipped commits, " +
 				"so this is always the released truth, not a maintained changelog.",
 			"inputSchema": obj(map[string]any{
@@ -503,9 +574,29 @@ func mcpToolDefs() []map[string]any {
 	}
 }
 
-// callTool dispatches one tools/call. Returns (text, isError, knownTool).
-func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, bool) {
+// toolResult is one tools/call outcome: display text, optional typed
+// structuredContent (tester wish #3 — agents shouldn't re-parse markdown),
+// and the tool-error flag.
+type toolResult struct {
+	text       string
+	structured any
+	isError    bool
+}
+
+// jsonStructured parses a captured command's JSON report so it can ride as
+// structuredContent alongside the text (nil if the text isn't JSON).
+func jsonStructured(stdout string) any {
+	var v any
+	if json.Unmarshal([]byte(strings.TrimSpace(stdout)), &v) == nil {
+		return v
+	}
+	return nil
+}
+
+// callTool dispatches one tools/call. Returns (result, knownTool).
+func (s *mcpServer) callTool(name string, args json.RawMessage) (toolResult, bool) {
 	var text string
+	var structured any
 	var err error
 	switch name {
 	case "orient":
@@ -515,13 +606,13 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 			return e
 		})
 	case "sql":
-		text, err = s.toolSQL(args)
+		text, structured, err = s.toolSQL(args)
 	case "pull":
-		text, err = s.toolPull(args)
+		text, structured, err = s.toolPull(args)
 	case "expect":
-		text, err = s.toolExpect(args)
+		text, structured, err = s.toolExpect(args)
 	case "verify":
-		text, err = s.toolVerify(args)
+		text, structured, err = s.toolVerify(args)
 	case "doctor":
 		var a struct {
 			ServerCard bool `json:"server_card"`
@@ -532,6 +623,7 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 			cargs = append(cargs, "--server")
 		}
 		stdout, _, cerr := runCaptured(cmdDoctor, cargs)
+		structured = jsonStructured(stdout)
 		text, err = capturedResult(stdout, cerr)
 	case "check":
 		var a struct {
@@ -542,10 +634,10 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 			FailOn string `json:"fail_on"`
 		}
 		if json.Unmarshal(args, &a) != nil || strings.TrimSpace(a.Table) == "" {
-			return `check needs {"table": "..."}`, true, true
+			return toolResult{text: `check needs {"table": "..."}`, isError: true}, true
 		}
 		if gerr := dashGuard(a.Table, a.Key, a.Time, a.MaxAge, a.FailOn); gerr != nil {
-			return firstLine(gerr), true, true
+			return toolResult{text: firstLine(gerr), isError: true}, true
 		}
 		cargs := append(append([]string{}, s.connArgs...), a.Table, "-o", "json")
 		for _, f := range []struct{ flag, v string }{
@@ -555,6 +647,7 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 			}
 		}
 		stdout, _, cerr := runCaptured(cmdCheck, cargs)
+		structured = jsonStructured(stdout)
 		text, err = capturedResult(stdout, cerr)
 	case "ping":
 		var a struct {
@@ -566,11 +659,13 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 			cargs = append(cargs, "-n", strconv.Itoa(a.N))
 		}
 		stdout, _, cerr := runCaptured(cmdPing, cargs)
+		structured = jsonStructured(stdout)
 		text, err = capturedResult(stdout, cerr)
 	case "feedback":
-		text, err = s.toolFeedback(args)
+		text, structured, err = s.toolFeedback(args)
 	case "version":
 		text = fmt.Sprintf("sparrow %s · bound to %s (profile: %s) · MCP stdio", versionString(), s.profile.URI, s.pname)
+		structured = map[string]any{"version": versionString(), "endpoint": s.profile.URI, "profile": s.pname}
 	case "whatsnew":
 		var a struct {
 			N int `json:"n"`
@@ -581,47 +676,49 @@ func (s *mcpServer) callTool(name string, args json.RawMessage) (string, bool, b
 		}
 		text, err = whatsnewMarkdown(a.N)
 	default:
-		return "", false, false
+		return toolResult{}, false
 	}
 	if err != nil {
-		return firstLine(err), true, true
+		return toolResult{text: firstLine(err), isError: true}, true
 	}
-	return text, false, true
+	return toolResult{text: text, structured: structured}, true
 }
 
 // ── tools ────────────────────────────────────────────────────────────────
 
-func (s *mcpServer) toolSQL(raw json.RawMessage) (string, error) {
+func (s *mcpServer) toolSQL(raw json.RawMessage) (string, any, error) {
 	var a struct {
 		Query   string `json:"query"`
 		MaxRows int    `json:"max_rows"`
 		Stats   bool   `json:"stats"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Query) == "" {
-		return "", fmt.Errorf(`sql needs {"query": "SELECT ..."}`)
+		return "", nil, fmt.Errorf(`sql needs {"query": "SELECT ..."}`)
 	}
 	if a.Stats {
 		// benchmark mode: the CLI's --stats anatomy, on its own fresh
 		// connection with the wire counter attached; the data itself goes to
 		// a temp file and is discarded — the anatomy (stderr) is the answer
 		if err := dashGuard(a.Query); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		tmp, err := os.CreateTemp("", "sparrow-mcp-*.csv")
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		tmp.Close()
 		defer os.Remove(tmp.Name())
 		cargs := append(append([]string{}, s.connArgs...), a.Query, "--stats", "-o", tmp.Name())
 		_, stderrTxt, cerr := runCaptured(cmdSQL, cargs)
-		return capturedResult(stderrTxt, cerr)
+		text, err := capturedResult(stderrTxt, cerr)
+		return text, nil, err
 	}
 	limit := s.defaultCap
 	if a.MaxRows > 0 {
 		limit = clampRows(a.MaxRows)
 	}
 	var out string
+	var structured any
 	err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
 		cols, err := querySchemaCols(ctx, cl, strings.TrimRight(a.Query, "; \t\r\n"))
 		if err != nil {
@@ -632,18 +729,31 @@ func (s *mcpServer) toolSQL(raw json.RawMessage) (string, error) {
 			return err
 		}
 		out = mcpTable(cols, rows, limit)
+		structured = rowsStructured(cols, rows, limit)
 		return nil
 	})
-	return out, err
+	return out, structured, err
 }
 
-func (s *mcpServer) toolPull(raw json.RawMessage) (string, error) {
+// rowsStructured is the typed sibling of mcpTable — same cap, same honesty.
+func rowsStructured(cols []string, rows [][]string, limit int) map[string]any {
+	truncated := len(rows) > limit
+	if truncated {
+		rows = rows[:limit]
+	}
+	if rows == nil {
+		rows = [][]string{}
+	}
+	return map[string]any{"columns": cols, "rows": rows, "row_count": len(rows), "truncated": truncated}
+}
+
+func (s *mcpServer) toolPull(raw json.RawMessage) (string, any, error) {
 	var a struct {
 		Ticket  string `json:"ticket"`
 		MaxRows int    `json:"max_rows"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Ticket) == "" {
-		return "", fmt.Errorf(`pull needs {"ticket": "{\"series\": [...]}"}`)
+		return "", nil, fmt.Errorf(`pull needs {"ticket": "{\"series\": [...]}"}`)
 	}
 	limit := s.defaultCap
 	if a.MaxRows > 0 {
@@ -651,6 +761,7 @@ func (s *mcpServer) toolPull(raw json.RawMessage) (string, error) {
 	}
 	ticket := withAcceptCompression([]byte(strings.TrimSpace(a.Ticket)), "lz4")
 	var out string
+	var structured any
 	err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
 		rdr, err := cl.DoGet(ctx, &flight.Ticket{Ticket: ticket})
 		if err != nil {
@@ -685,9 +796,10 @@ func (s *mcpServer) toolPull(raw json.RawMessage) (string, error) {
 			}
 		}
 		out = mcpTable(cols, rows, limit)
+		structured = rowsStructured(cols, rows, limit)
 		return nil
 	})
-	return out, err
+	return out, structured, err
 }
 
 // scalarArg accepts a JSON string OR number — LLM clients naturally send
@@ -730,7 +842,7 @@ func (x *intArg) UnmarshalJSON(b []byte) error {
 	return fmt.Errorf("must be an integer")
 }
 
-func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
+func (s *mcpServer) toolExpect(raw json.RawMessage) (string, any, error) {
 	var a struct {
 		Query    string    `json:"query"`
 		Eq       scalarArg `json:"eq"`
@@ -747,10 +859,10 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 		Cols     []string  `json:"cols"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil {
-		return "", fmt.Errorf("expect: %s", firstLine(err))
+		return "", nil, fmt.Errorf("expect: %s", firstLine(err))
 	}
 	if strings.TrimSpace(a.Query) == "" {
-		return "", fmt.Errorf(`expect needs {"query": "...", ...at least one assertion}`)
+		return "", nil, fmt.Errorf(`expect needs {"query": "...", ...at least one assertion}`)
 	}
 	inner := strings.TrimRight(strings.TrimSpace(a.Query), "; \t\r\n")
 	scalars := []struct {
@@ -768,7 +880,7 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 	needCount := aRows != nil || aRowsMin != nil || aRowsMax != nil || a.Empty || a.Nonempty
 	needCols := len(a.Cols) > 0
 	if !needScalar && !needCount && !needCols {
-		return "", fmt.Errorf("expect: give at least one assertion (eq/rows/empty/cols/…)")
+		return "", nil, fmt.Errorf("expect: give at least one assertion (eq/rows/empty/cols/…)")
 	}
 
 	var results []expectResult
@@ -829,7 +941,7 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	var b strings.Builder
 	fails := 0
@@ -849,34 +961,36 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 	} else {
 		fmt.Fprintf(&b, "ok — all %d assertion(s) hold\n", len(results))
 	}
-	return b.String(), nil
+	structured := map[string]any{"ok": fails == 0, "assertions": results}
+	return b.String(), structured, nil
 }
 
-func (s *mcpServer) toolVerify(raw json.RawMessage) (string, error) {
+func (s *mcpServer) toolVerify(raw json.RawMessage) (string, any, error) {
 	var a struct {
 		Receipt string `json:"receipt"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Receipt) == "" {
-		return "", fmt.Errorf(`verify needs {"receipt": "<the receipt JSON document>"}`)
+		return "", nil, fmt.Errorf(`verify needs {"receipt": "<the receipt JSON document>"}`)
 	}
 	var r receipt
 	if err := json.Unmarshal([]byte(a.Receipt), &r); err != nil {
-		return "", fmt.Errorf("not a sparrow receipt (bad JSON): %s", firstLine(err))
+		return "", nil, fmt.Errorf("not a sparrow receipt (bad JSON): %s", firstLine(err))
 	}
 	if r.Kind == "" || r.Query == "" {
-		return "", fmt.Errorf("not a sparrow receipt (missing sparrow_receipt/query)")
+		return "", nil, fmt.Errorf("not a sparrow receipt (missing sparrow_receipt/query)")
 	}
 	if r.Result.DigestSum == "" || r.Result.DigestXor == "" {
-		return "", fmt.Errorf("incomplete receipt (missing result fingerprint)")
+		return "", nil, fmt.Errorf("incomplete receipt (missing result fingerprint)")
 	}
 	if r.Algo != "" && r.Algo != receiptAlgo {
-		return "", fmt.Errorf("receipt algo %q is not supported by this binary (%s)", r.Algo, receiptAlgo)
+		return "", nil, fmt.Errorf("receipt algo %q is not supported by this binary (%s)", r.Algo, receiptAlgo)
 	}
 	// The MCP server is BOUND to one endpoint. On the receipt's own endpoint
 	// this is a bare verify (identity gates); on any other it has `verify -s`
 	// semantics (vendor reported, data agreement gates) — same rules as the CLI.
 	usedOverride := r.Server.Endpoint != s.profile.URI
 	var out string
+	var structured any
 	err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
 		nowVendor := probeVendor(ctx, cl)
 		res, ferr := fingerprint(ctx, cl, r.Query)
@@ -889,6 +1003,12 @@ func (s *mcpServer) toolVerify(raw json.RawMessage) (string, error) {
 		vendorMatch := nowVendor == r.Server.Vendor
 		dataOK := rowsMatch && digestMatch && colsMatch
 		ok := dataOK && (usedOverride || vendorMatch)
+		structured = map[string]any{
+			"ok": ok, "endpoint": s.profile.URI, "override": usedOverride,
+			"vendor_now": nowVendor, "vendor_receipt": r.Server.Vendor, "vendor_match": vendorMatch,
+			"rows_match": rowsMatch, "digest_match": digestMatch, "columns_match": colsMatch,
+			"receipt_rows": r.Result.Rows, "now_rows": res.Rows,
+		}
 		mark := func(b bool) string {
 			if b {
 				return "✓"
@@ -913,17 +1033,17 @@ func (s *mcpServer) toolVerify(raw json.RawMessage) (string, error) {
 		out = b.String()
 		return nil
 	})
-	return out, err
+	return out, structured, err
 }
 
-func (s *mcpServer) toolFeedback(raw json.RawMessage) (string, error) {
+func (s *mcpServer) toolFeedback(raw json.RawMessage) (string, any, error) {
 	var a struct {
 		Message  string `json:"message"`
 		Category string `json:"category"`
 		From     string `json:"from"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Message) == "" {
-		return "", fmt.Errorf(`feedback needs {"message": "..."}`)
+		return "", nil, fmt.Errorf(`feedback needs {"message": "..."}`)
 	}
 	if a.Category == "" {
 		a.Category = "general"
@@ -941,9 +1061,9 @@ func (s *mcpServer) toolFeedback(raw json.RawMessage) (string, error) {
 	}
 	ts, err := sendFeedback(url, strings.TrimSpace(a.Message), a.Category, user, s.profile.URI)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return "feedback delivered (" + ts + ") — thank you\n", nil
+	return "feedback delivered (" + ts + ") — thank you\n", map[string]any{"delivered": true, "ts": ts}, nil
 }
 
 // mcpTable renders rows as a markdown table, capped; fetch limit+1 rows so
@@ -990,4 +1110,172 @@ func mcpTable(cols []string, rows [][]string, limit int) string {
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// ── resources & prompts (tester wish #2 — MCP's other two primitives) ─────
+
+// listTableNames fetches just the table names (no schemas) for resource
+// enumeration — cached per session (the catalog of a serving node is stable).
+func (s *mcpServer) listTableNames() ([]string, error) {
+	s.mu.Lock()
+	cached := s.tableNames
+	s.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+	var names []string
+	err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
+		info, err := cl.GetTables(ctx, &flightsql.GetTablesOpts{})
+		if err != nil {
+			return err
+		}
+		for _, ep := range info.Endpoint {
+			rdr, err := cl.DoGet(ctx, ep.Ticket)
+			if err != nil {
+				return err
+			}
+			idx := -1
+			for rdr.Next() {
+				rec := rdr.Record()
+				if idx < 0 {
+					for i, f := range rec.Schema().Fields() {
+						if f.Name == "table_name" {
+							idx = i
+						}
+					}
+				}
+				if idx < 0 {
+					continue
+				}
+				for r := 0; r < int(rec.NumRows()); r++ {
+					if !rec.Column(idx).IsNull(r) {
+						names = append(names, cell(rec.Column(idx), r))
+					}
+				}
+			}
+			err = rdr.Err()
+			rdr.Release()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.tableNames = names
+	s.mu.Unlock()
+	return names, nil
+}
+
+func (s *mcpServer) resourceList() ([]map[string]any, error) {
+	rs := []map[string]any{{
+		"uri": "sparrow://orient", "name": "orient",
+		"title":       "Server map — vendor, tables, schemas",
+		"description": "The full orientation map of the bound Flight SQL server, as markdown. Read this once instead of spending tool calls on discovery.",
+		"mimeType":    "text/markdown",
+	}}
+	names, err := s.listTableNames()
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range names {
+		rs = append(rs, map[string]any{
+			"uri": "sparrow://table/" + n, "name": n,
+			"title":       "Schema of " + n,
+			"description": "Column names, types and nullability of " + n + ".",
+			"mimeType":    "text/markdown",
+		})
+	}
+	return rs, nil
+}
+
+func (s *mcpServer) resourceRead(uri string) (string, error) {
+	switch {
+	case uri == "sparrow://orient":
+		var md string
+		err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
+			var e error
+			md, e = orientMarkdown(ctx, cl, s.profile.URI, s.pname)
+			return e
+		})
+		return md, err
+	case strings.HasPrefix(uri, "sparrow://table/"):
+		name := strings.TrimPrefix(uri, "sparrow://table/")
+		if name == "" || strings.HasPrefix(name, "-") {
+			return "", fmt.Errorf("bad table name %q", name)
+		}
+		var md string
+		err := s.withClient(func(ctx context.Context, cl *flightsql.Client) error {
+			info, err := cl.Execute(ctx, "SELECT * FROM "+tableExpr(name)+" LIMIT 0")
+			if err != nil {
+				return err
+			}
+			for _, ep := range info.Endpoint {
+				rdr, err := cl.DoGet(ctx, ep.Ticket)
+				if err != nil {
+					return err
+				}
+				sc := rdr.Schema()
+				for rdr.Next() {
+				}
+				rdr.Release()
+				if sc != nil {
+					var b strings.Builder
+					fmt.Fprintf(&b, "## %s\n\n| column | type | nullable |\n| --- | --- | --- |\n", name)
+					for _, f := range sc.Fields() {
+						null := ""
+						if f.Nullable {
+							null = "yes"
+						}
+						fmt.Fprintf(&b, "| %s | %s | %s |\n", f.Name, f.Type, null)
+					}
+					md = b.String()
+					return nil
+				}
+			}
+			return fmt.Errorf("no schema returned")
+		})
+		return md, err
+	}
+	return "", fmt.Errorf("unknown uri %q (sparrow://orient or sparrow://table/<name>)", uri)
+}
+
+func mcpPromptDefs() []map[string]any {
+	return []map[string]any{
+		{
+			"name": "explore", "title": "Explore this dataset",
+			"description": "Map the bound server and report what the data holds, with receipts.",
+		},
+		{
+			"name": "quality-gate", "title": "Run a data-quality gate",
+			"description": "Run sparrow's data-quality checks on one table and interpret the findings.",
+			"arguments": []map[string]any{{
+				"name": "table", "description": "the table to gate", "required": true,
+			}},
+		},
+	}
+}
+
+func (s *mcpServer) promptGet(name string, args map[string]string) (string, bool) {
+	switch name {
+	case "explore":
+		return "Explore the Flight SQL server at " + s.profile.URI + " using the sparrow tools. " +
+			"Start from the sparrow://orient resource (or the orient tool) for the map, sample the " +
+			"interesting tables with sql (always LIMIT — results are row-capped), and report: what the " +
+			"data covers, its time range, and 2–3 concrete findings. Back each reported number with an " +
+			"expect assertion so it is checkable, not just plausible.", true
+	case "quality-gate":
+		table := strings.TrimSpace(args["table"])
+		if table == "" {
+			table = "<table>"
+		}
+		return "Run sparrow's check tool on " + table + " (add key/time columns if the schema resource " +
+			"suggests obvious ones). Interpret the findings: which are real data problems vs expected " +
+			"shape? Verify the most important one with an expect assertion, and summarize the table's " +
+			"health in three sentences.", true
+	}
+	return "", false
 }

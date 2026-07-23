@@ -43,6 +43,12 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	if init["protocolVersion"] != "2025-06-18" {
 		t.Errorf("protocolVersion not echoed: %v", init["protocolVersion"])
 	}
+	caps := init["capabilities"].(map[string]any)
+	for _, c := range []string{"tools", "resources", "prompts"} {
+		if _, ok := caps[c]; !ok {
+			t.Errorf("capability %q not advertised", c)
+		}
+	}
 	si := init["serverInfo"].(map[string]any)
 	if si["name"] != "sparrow" || si["version"] != version {
 		t.Errorf("serverInfo wrong: %v", si)
@@ -66,6 +72,21 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		}
 		if _, ok := m["inputSchema"].(map[string]any); !ok {
 			t.Errorf("tool %q has no inputSchema", name)
+		}
+		// wish #1: every tool annotated; HONESTLY — feedback SENDS a message,
+		// so it must NOT claim readOnlyHint (that's what lets hosts auto-
+		// approve the rest)
+		ann, ok := m["annotations"].(map[string]any)
+		if !ok {
+			t.Errorf("tool %q has no annotations", name)
+			continue
+		}
+		wantReadOnly := name != "feedback"
+		if ann["readOnlyHint"] != wantReadOnly {
+			t.Errorf("tool %q readOnlyHint = %v, want %v", name, ann["readOnlyHint"], wantReadOnly)
+		}
+		if ann["title"] == nil {
+			t.Errorf("tool %q has no title annotation", name)
 		}
 	}
 	if _, ok := frames[2]["result"]; !ok {
@@ -121,6 +142,36 @@ func TestMCPErrors(t *testing.T) {
 	vtext := res["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(vtext, version) || !strings.Contains(vtext, "grpc://test:1") {
 		t.Errorf("version text missing version/binding: %q", vtext)
+	}
+}
+
+// prompts and the version tool's structuredContent are client-side — fully
+// testable offline.
+func TestMCPPromptsAndStructured(t *testing.T) {
+	frames := mcpSession(t,
+		`{"jsonrpc":"2.0","id":1,"method":"prompts/list"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"quality-gate","arguments":{"table":"series_data"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"nope"}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"version","arguments":{}}}`,
+	)
+	if len(frames) != 4 {
+		t.Fatalf("want 4 frames, got %d", len(frames))
+	}
+	prompts := frames[0]["result"].(map[string]any)["prompts"].([]any)
+	if len(prompts) != 2 {
+		t.Fatalf("want 2 prompts, got %d", len(prompts))
+	}
+	msgs := frames[1]["result"].(map[string]any)["messages"].([]any)
+	txt := msgs[0].(map[string]any)["content"].(map[string]any)["text"].(string)
+	if !strings.Contains(txt, "series_data") {
+		t.Errorf("prompt argument not substituted: %q", txt)
+	}
+	if _, ok := frames[2]["error"]; !ok {
+		t.Errorf("unknown prompt must error: %v", frames[2])
+	}
+	sc, ok := frames[3]["result"].(map[string]any)["structuredContent"].(map[string]any)
+	if !ok || sc["version"] != version {
+		t.Errorf("version structuredContent missing/wrong: %v", frames[3])
 	}
 }
 

@@ -418,7 +418,14 @@ shape adds over shelling out: a **warm connection** (one dial + auth held
 across calls — a CLI invocation re-dials every time), **schema-validated
 calls** (SQL rides as a JSON field; the shell-quoting failure class is gone),
 and results row-capped by default so a query can't flood a model's context.
-Point sparrow at any Flight SQL server and that server now speaks MCP:
+It's a first-class MCP citizen, not CLI verbs in a trenchcoat: every tool
+carries honest **read-only annotations** (hosts can auto-approve; `feedback`
+is marked outward because it really does send), the server map and per-table
+schemas are **resources** (`sparrow://orient`, `sparrow://table/<name>`) a
+host can load as ambient context, two starter **prompts** ship in-box, and
+every table/JSON result carries typed **structuredContent** so agents never
+re-parse markdown. Point sparrow at any Flight SQL server and that server
+now speaks MCP:
 
 ```json
 { "mcpServers": { "sparrow": { "command": "sparrow", "args": ["mcp", "-s", "sparrow"] } } }
