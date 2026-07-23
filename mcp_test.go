@@ -124,6 +124,53 @@ func TestMCPErrors(t *testing.T) {
 	}
 }
 
+// JSON-RPC edges from the tester's protocol round: batch arrays are Invalid
+// Request (-32600, not parse error); a methodless request is -32600; a
+// notification-form request of ANY method gets NO answer; id:null is a real
+// (answerable) id — only a MISSING id makes a notification.
+func TestMCPProtocolEdges(t *testing.T) {
+	frames := mcpSession(t,
+		`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`,
+		`{"jsonrpc":"2.0","id":9}`,
+		`{"jsonrpc":"2.0","method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":null,"method":"ping"}`,
+	)
+	if len(frames) != 3 { // batch err, missing-method err, null-id ping result
+		t.Fatalf("want 3 frames, got %d: %v", len(frames), frames)
+	}
+	if e := frames[0]["error"].(map[string]any); e["code"].(float64) != -32600 {
+		t.Errorf("batch must be -32600: %v", frames[0])
+	}
+	if e := frames[1]["error"].(map[string]any); e["code"].(float64) != -32600 {
+		t.Errorf("missing method must be -32600: %v", frames[1])
+	}
+	if _, ok := frames[2]["result"]; !ok || frames[2]["id"] != nil {
+		t.Errorf("id:null ping must be answered with id null: %v", frames[2])
+	}
+}
+
+// MCP-2: assertion values arrive as whatever JSON type the model chose.
+func TestFlexibleArgs(t *testing.T) {
+	var s scalarArg
+	for in, want := range map[string]string{`"x"`: "x", `10217`: "10217", `3.5`: "3.5"} {
+		if err := json.Unmarshal([]byte(in), &s); err != nil || s.v == nil || *s.v != want {
+			t.Errorf("scalarArg(%s) = %v, %v (want %q)", in, s.v, err, want)
+		}
+	}
+	if err := json.Unmarshal([]byte(`true`), &s); err == nil {
+		t.Error("scalarArg must reject a bool")
+	}
+	var n intArg
+	for in, want := range map[string]int{`10`: 10, `"7"`: 7} {
+		if err := json.Unmarshal([]byte(in), &n); err != nil || n.v == nil || *n.v != want {
+			t.Errorf("intArg(%s) = %v, %v (want %d)", in, n.v, err, want)
+		}
+	}
+	if err := json.Unmarshal([]byte(`"x"`), &n); err == nil {
+		t.Error("intArg must reject a non-numeric string")
+	}
+}
+
 // a table name that would parse as a FLAG must be rejected before the
 // captured command runs — parseFlags os.Exit(3)s on unknown flags, which
 // would kill the whole server (the dash guard is load-bearing).

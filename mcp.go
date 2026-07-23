@@ -122,8 +122,14 @@ func (s *mcpServer) closeClient() {
 }
 
 // withClient runs fn with the warm client under a per-call timeout. On a
-// connection-class failure it drops the cached client, re-dials once and
-// retries — a long-lived server must survive a server restart between calls.
+// connection-class OR stale-auth failure it drops the cached client, re-dials
+// once and retries — the re-dial runs the FULL basic→bearer bootstrap, so a
+// long-lived server survives both a Flight-server restart and a bearer-TTL
+// expiry mid-session (tester MCP-1: a bearer-minting server restarted between
+// calls answers "Token verification failed" — InvalidArgument, NOT
+// connection-class, so the conn matcher alone never retried and the stale
+// adopted token was reused forever). Bounded: one retry; genuinely bad creds
+// fail once more and surface.
 func (s *mcpServer) withClient(fn func(ctx context.Context, cl *flightsql.Client) error) error {
 	run := func() error {
 		cl, base, err := s.client()
@@ -139,11 +145,26 @@ func (s *mcpServer) withClient(fn func(ctx context.Context, cl *flightsql.Client
 		return nil
 	}
 	var ce connError
-	if errors.As(err, &ce) || errors.As(classifyConnErr(err, err), &ce) {
+	if errors.As(err, &ce) || errors.As(classifyConnErr(err, err), &ce) || isAuthStale(err) {
 		s.closeClient()
 		return run()
 	}
 	return err
+}
+
+// isAuthStale spots a rejected/expired session token — the signal that the
+// warm connection's adopted Bearer outlived the server's memory of it. A
+// false positive (a query error mentioning "token") costs one harmless
+// re-dial + retry of a read-only call.
+func isAuthStale(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, m := range []string{"token verification", "invalid signature", "token expired",
+		"expired token", "invalid token", "invalid bearer", "unauthenticated"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // asArgs replays the parsed connection flags as CLI arguments, so a captured
@@ -268,12 +289,30 @@ func (s *mcpServer) serve(r io.Reader, w io.Writer) error {
 		if line == "" {
 			continue
 		}
+		// a JSON array parses fine but isn't a request object — that's
+		// -32600 Invalid Request, not -32700 Parse Error (tester minor b)
+		if strings.HasPrefix(line, "[") {
+			s.writeError(w, nil, -32600, "invalid request: batch requests are not supported")
+			continue
+		}
 		var req rpcRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			s.writeError(w, nil, -32700, "parse error: "+firstLine(err))
 			continue
 		}
-		isNotification := len(req.ID) == 0 || string(req.ID) == "null"
+		// JSON-RPC 2.0: only a MISSING id makes a notification — id:null is a
+		// (discouraged but answerable) request id (tester minor a). A request
+		// object without a method is Invalid Request (tester minor c).
+		isNotification := len(req.ID) == 0
+		if req.Method == "" {
+			if !isNotification {
+				s.writeError(w, req.ID, -32600, "invalid request: missing method")
+			}
+			continue
+		}
+		if isNotification && !strings.HasPrefix(req.Method, "notifications/") {
+			continue // notifications are NEVER answered, whatever the method
+		}
 		switch req.Method {
 		case "initialize":
 			var p struct {
@@ -383,12 +422,12 @@ func mcpToolDefs() []map[string]any {
 				"cols checks the result's column names exactly, in order. A failed assertion is a normal result, not a tool error.",
 			"inputSchema": obj(map[string]any{
 				"query":    map[string]any{"type": "string", "description": "the SQL whose result is asserted"},
-				"eq":       map[string]any{"type": "string", "description": "scalar equals (numeric when both parse, else string)"},
-				"ne":       map[string]any{"type": "string", "description": "scalar not-equals"},
-				"gt":       map[string]any{"type": "string", "description": "scalar greater-than"},
-				"lt":       map[string]any{"type": "string", "description": "scalar less-than"},
-				"ge":       map[string]any{"type": "string", "description": "scalar >="},
-				"le":       map[string]any{"type": "string", "description": "scalar <="},
+				"eq":       map[string]any{"type": []string{"string", "number"}, "description": "scalar equals (numeric when both parse, else string)"},
+				"ne":       map[string]any{"type": []string{"string", "number"}, "description": "scalar not-equals"},
+				"gt":       map[string]any{"type": []string{"string", "number"}, "description": "scalar greater-than"},
+				"lt":       map[string]any{"type": []string{"string", "number"}, "description": "scalar less-than"},
+				"ge":       map[string]any{"type": []string{"string", "number"}, "description": "scalar >="},
+				"le":       map[string]any{"type": []string{"string", "number"}, "description": "scalar <="},
 				"rows":     map[string]any{"type": "integer", "description": "exact row count"},
 				"rows_min": map[string]any{"type": "integer", "description": "minimum row count"},
 				"rows_max": map[string]any{"type": "integer", "description": "maximum row count"},
@@ -651,23 +690,66 @@ func (s *mcpServer) toolPull(raw json.RawMessage) (string, error) {
 	return out, err
 }
 
+// scalarArg accepts a JSON string OR number — LLM clients naturally send
+// {"eq": 10217} for a numeric compare (tester MCP-2); the CLI's compareScalar
+// is numeric-aware over strings anyway, so a number just becomes its string.
+type scalarArg struct{ v *string }
+
+func (x *scalarArg) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		x.v = &s
+		return nil
+	}
+	var n json.Number
+	if json.Unmarshal(b, &n) == nil {
+		s := n.String()
+		x.v = &s
+		return nil
+	}
+	return fmt.Errorf("must be a string or a number")
+}
+
+// intArg accepts a JSON integer OR a numeric string (the symmetric MCP-2
+// courtesy for the row-count assertions).
+type intArg struct{ v *int }
+
+func (x *intArg) UnmarshalJSON(b []byte) error {
+	var n int
+	if json.Unmarshal(b, &n) == nil {
+		x.v = &n
+		return nil
+	}
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		if i, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+			x.v = &i
+			return nil
+		}
+	}
+	return fmt.Errorf("must be an integer")
+}
+
 func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 	var a struct {
-		Query    string   `json:"query"`
-		Eq       *string  `json:"eq"`
-		Ne       *string  `json:"ne"`
-		Gt       *string  `json:"gt"`
-		Lt       *string  `json:"lt"`
-		Ge       *string  `json:"ge"`
-		Le       *string  `json:"le"`
-		Rows     *int     `json:"rows"`
-		RowsMin  *int     `json:"rows_min"`
-		RowsMax  *int     `json:"rows_max"`
-		Empty    bool     `json:"empty"`
-		Nonempty bool     `json:"nonempty"`
-		Cols     []string `json:"cols"`
+		Query    string    `json:"query"`
+		Eq       scalarArg `json:"eq"`
+		Ne       scalarArg `json:"ne"`
+		Gt       scalarArg `json:"gt"`
+		Lt       scalarArg `json:"lt"`
+		Ge       scalarArg `json:"ge"`
+		Le       scalarArg `json:"le"`
+		Rows     intArg    `json:"rows"`
+		RowsMin  intArg    `json:"rows_min"`
+		RowsMax  intArg    `json:"rows_max"`
+		Empty    bool      `json:"empty"`
+		Nonempty bool      `json:"nonempty"`
+		Cols     []string  `json:"cols"`
 	}
-	if err := json.Unmarshal(raw, &a); err != nil || strings.TrimSpace(a.Query) == "" {
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return "", fmt.Errorf("expect: %s", firstLine(err))
+	}
+	if strings.TrimSpace(a.Query) == "" {
 		return "", fmt.Errorf(`expect needs {"query": "...", ...at least one assertion}`)
 	}
 	inner := strings.TrimRight(strings.TrimSpace(a.Query), "; \t\r\n")
@@ -675,14 +757,15 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 		v  *string
 		k  string
 		op string
-	}{{a.Eq, "eq", "=="}, {a.Ne, "ne", "!="}, {a.Gt, "gt", ">"}, {a.Lt, "lt", "<"}, {a.Ge, "ge", ">="}, {a.Le, "le", "<="}}
+	}{{a.Eq.v, "eq", "=="}, {a.Ne.v, "ne", "!="}, {a.Gt.v, "gt", ">"}, {a.Lt.v, "lt", "<"}, {a.Ge.v, "ge", ">="}, {a.Le.v, "le", "<="}}
 	needScalar := false
 	for _, sc := range scalars {
 		if sc.v != nil {
 			needScalar = true
 		}
 	}
-	needCount := a.Rows != nil || a.RowsMin != nil || a.RowsMax != nil || a.Empty || a.Nonempty
+	aRows, aRowsMin, aRowsMax := a.Rows.v, a.RowsMin.v, a.RowsMax.v
+	needCount := aRows != nil || aRowsMin != nil || aRowsMax != nil || a.Empty || a.Nonempty
 	needCols := len(a.Cols) > 0
 	if !needScalar && !needCount && !needCols {
 		return "", fmt.Errorf("expect: give at least one assertion (eq/rows/empty/cols/…)")
@@ -719,14 +802,14 @@ func (s *mcpServer) toolExpect(raw json.RawMessage) (string, error) {
 				n, _ = strconv.Atoi(strings.TrimSpace(row[0]))
 			}
 			got := strconv.Itoa(n)
-			if a.Rows != nil {
-				add(fmt.Sprintf("rows == %d", *a.Rows), strconv.Itoa(*a.Rows), got, n == *a.Rows)
+			if aRows != nil {
+				add(fmt.Sprintf("rows == %d", *aRows), strconv.Itoa(*aRows), got, n == *aRows)
 			}
-			if a.RowsMin != nil {
-				add(fmt.Sprintf("rows >= %d", *a.RowsMin), strconv.Itoa(*a.RowsMin), got, n >= *a.RowsMin)
+			if aRowsMin != nil {
+				add(fmt.Sprintf("rows >= %d", *aRowsMin), strconv.Itoa(*aRowsMin), got, n >= *aRowsMin)
 			}
-			if a.RowsMax != nil {
-				add(fmt.Sprintf("rows <= %d", *a.RowsMax), strconv.Itoa(*a.RowsMax), got, n <= *a.RowsMax)
+			if aRowsMax != nil {
+				add(fmt.Sprintf("rows <= %d", *aRowsMax), strconv.Itoa(*aRowsMax), got, n <= *aRowsMax)
 			}
 			if a.Empty {
 				add("rows == 0 (empty)", "0", got, n == 0)
